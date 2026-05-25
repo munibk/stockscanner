@@ -37,6 +37,34 @@ st.markdown("""
 <style>
     .block-container { padding-top: 1.5rem; }
     div[data-testid="metric-container"] { background: #1e1e2e; border-radius: 8px; padding: 8px; }
+
+    /* ── Mobile: stack columns vertically ── */
+    @media (max-width: 768px) {
+        [data-testid="column"] {
+            width: 100% !important;
+            flex: 1 1 100% !important;
+            min-width: 100% !important;
+        }
+        .block-container {
+            padding-left: 0.75rem !important;
+            padding-right: 0.75rem !important;
+            padding-top: 0.75rem !important;
+        }
+        /* Horizontally scrollable table */
+        [data-testid="stDataFrame"] > div {
+            overflow-x: auto !important;
+        }
+        div[data-testid="metric-container"] {
+            padding: 4px !important;
+        }
+        div[data-testid="metric-container"] label {
+            font-size: 0.75rem !important;
+        }
+        [data-testid="stExpander"] summary p,
+        [data-testid="stExpanderToggleIcon"] + div p {
+            font-size: 0.9rem !important;
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -180,7 +208,8 @@ for r in results:
         "Score":      r["score"],
         "RSI":        r["rsi"],
         "ADX":        r["adx"] if r["adx"] else None,
-        "Vol Ratio":  r["vol_ratio"],        "R:R":        f"{r.get('rr_ratio', 0):.1f}:1",        "Target":     f"₹{r['proj_up']:,.2f}  ({r['proj_up_pct']:+.1f}%)",
+        "Vol Ratio":  r["vol_ratio"],
+        "Target":     f"₹{r['proj_up']:,.2f}  ({r['proj_up_pct']:+.1f}%)",
         "Stop":       f"₹{r['proj_down']:,.2f}  ({r['proj_down_pct']:+.1f}%)",
         "Timeline":   r["proj_timeline"],
     })
@@ -207,9 +236,9 @@ for r in results:
     label    = f"{sig_icon}  **{r['ticker']}**  —  {r['signal']}  ({r['score']:.0f}/100)  ₹{r['price']:,.2f}"
 
     with st.expander(label, expanded=(len(results) == 1)):
-        chart_col, info_col = st.columns([3, 1])
+        info_col, chart_col = st.columns([1, 3])
 
-        # ── Info panel ──
+        # ── Info panel (shown first so it stacks on top on mobile) ──
         with info_col:
             st.markdown(f"### {r['ticker']}")
             sig_color = {"BUY": "green", "SELL": "red", "HOLD": "orange"}[r["signal"]]
@@ -323,7 +352,7 @@ for r in results:
                           line_width=0, row=3, col=1)
 
             fig.update_layout(
-                height=500,
+                height=420,
                 template="plotly_dark",
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
