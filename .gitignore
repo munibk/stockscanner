@@ -1,0 +1,18 @@
+# Zerodha credentials — never commit these
+zerodha.cfg
+.zerodha_token.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
