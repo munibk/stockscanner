@@ -54,9 +54,9 @@ with st.sidebar:
     custom_input = ""
     if mode == "Custom Tickers":
         custom_input = st.text_area(
-            "Tickers (space or comma separated)",
-            placeholder="RELIANCE TCS INFY HDFCBANK",
-            height=80,
+            "Tickers (space or comma or newline separated)",
+            placeholder="RELIANCE TCS INFY\nHDFCBANK ICICIBANK VBL",
+            height=100,
         )
 
     interval = st.selectbox(
@@ -94,7 +94,7 @@ if mode == "Nifty 50":
         tickers = fetch_nifty50_tickers()
 
 elif mode == "Custom Tickers":
-    raw     = custom_input.replace(",", " ").split()
+    raw     = custom_input.replace(",", " ").replace("\n", " ").split()
     tickers = [t.upper().strip() for t in raw if t.strip()]
     if not tickers:
         st.error("Enter at least one ticker in the sidebar.")
@@ -180,8 +180,7 @@ for r in results:
         "Score":      r["score"],
         "RSI":        r["rsi"],
         "ADX":        r["adx"] if r["adx"] else None,
-        "Vol Ratio":  r["vol_ratio"],
-        "Target":     f"₹{r['proj_up']:,.2f}  ({r['proj_up_pct']:+.1f}%)",
+        "Vol Ratio":  r["vol_ratio"],        "R:R":        f"{r.get('rr_ratio', 0):.1f}:1",        "Target":     f"₹{r['proj_up']:,.2f}  ({r['proj_up_pct']:+.1f}%)",
         "Stop":       f"₹{r['proj_down']:,.2f}  ({r['proj_down_pct']:+.1f}%)",
         "Timeline":   r["proj_timeline"],
     })
@@ -215,7 +214,7 @@ for r in results:
             st.markdown(f"### {r['ticker']}")
             sig_color = {"BUY": "green", "SELL": "red", "HOLD": "orange"}[r["signal"]]
             st.markdown(f"**Signal:** :{sig_color}[{r['signal']}] &nbsp; Score: **{r['score']:.0f}/100**")
-            st.markdown(f"**RSI:** {r['rsi']}  |  **ADX:** {r['adx'] or '—'}  |  **Vol:** {r['vol_ratio']}x")
+            st.markdown(f"**RSI:** {r['rsi']}  |  **ADX:** {r['adx'] or '—'}  |  **Vol:** {r['vol_ratio']}x  |  **R:R:** {r.get('rr_ratio', 0):.1f}:1")
             st.markdown("---")
             st.markdown(f"🎯 **Target:** ₹{r['proj_up']:,.2f}  ({r['proj_up_pct']:+.1f}%)  *{r['proj_timeline']}*")
             st.markdown(f"🛑 **Stop:**   ₹{r['proj_down']:,.2f}  ({r['proj_down_pct']:+.1f}%)")

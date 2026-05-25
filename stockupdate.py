@@ -419,11 +419,25 @@ def find_support_resistance(df: pd.DataFrame, price: float, atr: float) -> dict:
     resistances = cluster(resistances)
     supports    = cluster(list(reversed(cluster(list(reversed(supports))))))
 
+    # Score levels by how many times price has tested them (more touches = stronger zone)
+    def touch_count(level: float, all_highs, all_lows, tolerance: float) -> int:
+        touches = 0
+        for h, l in zip(all_highs, all_lows):
+            if abs(h - level) / price < tolerance or abs(l - level) / price < tolerance:
+                touches += 1
+        return touches
+
+    tol = 0.012  # 1.2% tolerance for a "touch"
+    resistances = sorted(resistances,
+                         key=lambda v: -touch_count(v, highs, lows, tol))[:3]
+    supports    = sorted(supports,
+                         key=lambda v: -touch_count(v, highs, lows, tol))[:3]
+
     return {
-        "resistance":   resistances[:3],
-        "support":      supports[:3],
-        "nearest_res":  resistances[0] if resistances else None,
-        "nearest_sup":  supports[0]    if supports    else None,
+        "resistance":  resistances,
+        "support":     supports,
+        "nearest_res": min(resistances, key=lambda v: v - price) if resistances else None,
+        "nearest_sup": max(supports,    key=lambda v: v)         if supports    else None,
     }
 
 # ── Indicator calculation ───────────────────────────────────────────────────
@@ -433,33 +447,62 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     low   = df["Low"]
     vol   = df["Volume"]
 
-    # RSI
+    # RSI (14) + smoothed RSI to reduce whipsaws
     df["RSI"] = ta.momentum.RSIIndicator(close, window=14).rsi()
+    df["RSI_smooth"] = df["RSI"].ewm(span=3).mean()
 
-    # MACD
-    macd_obj      = ta.trend.MACD(close)
-    df["MACD"]    = macd_obj.macd()
-    df["MACD_sig"] = macd_obj.macd_signal()
+    # MACD (standard 12/26/9)
+    macd_obj        = ta.trend.MACD(close)
+    df["MACD"]      = macd_obj.macd()
+    df["MACD_sig"]  = macd_obj.macd_signal()
     df["MACD_hist"] = macd_obj.macd_diff()
+    # Histogram slope: rising = momentum building
+    df["MACD_hist_slope"] = df["MACD_hist"].diff()
 
     # Moving averages
+    df["EMA9"]   = ta.trend.EMAIndicator(close, window=9).ema_indicator()
     df["EMA20"]  = ta.trend.EMAIndicator(close, window=20).ema_indicator()
     df["EMA50"]  = ta.trend.EMAIndicator(close, window=50).ema_indicator()
     df["SMA200"] = ta.trend.SMAIndicator(close, window=200).sma_indicator()
 
-    # Bollinger Bands
-    bb           = ta.volatility.BollingerBands(close)
-    df["BB_up"]  = bb.bollinger_hband()
-    df["BB_low"] = bb.bollinger_lband()
+    # Bollinger Bands (20,2) + %B position within bands
+    bb            = ta.volatility.BollingerBands(close, window=20, window_dev=2)
+    df["BB_up"]   = bb.bollinger_hband()
+    df["BB_low"]  = bb.bollinger_lband()
+    df["BB_mid"]  = bb.bollinger_mavg()
+    df["BB_pct"]  = bb.bollinger_pband()    # 0=lower, 0.5=mid, 1=upper
+    df["BB_width"] = (df["BB_up"] - df["BB_low"]) / df["BB_mid"]  # band width as % of mid
 
-    # Volume (20-period avg)
-    df["Vol_avg"] = vol.rolling(20).mean()
+    # Stochastic RSI (more sensitive than plain RSI)
+    stoch = ta.momentum.StochRSIIndicator(close, window=14, smooth1=3, smooth2=3)
+    df["StochRSI_K"] = stoch.stochrsi_k()
+    df["StochRSI_D"] = stoch.stochrsi_d()
 
-    # ADX (trend strength)
-    df["ADX"] = ta.trend.ADXIndicator(high, low, close).adx()
+    # Williams %R (overbought/oversold, -80 oversold, -20 overbought)
+    df["WilliamsR"] = ta.momentum.WilliamsRIndicator(high, low, close, lbp=14).williams_r()
 
-    # ATR (volatility — used for price projections)
-    df["ATR"] = ta.volatility.AverageTrueRange(high, low, close).average_true_range()
+    # Volume analysis
+    df["Vol_avg"]   = vol.rolling(20).mean()
+    df["Vol_ratio"] = vol / df["Vol_avg"].replace(0, float("nan"))
+    # On-Balance Volume — accumulation vs distribution
+    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(close, vol).on_balance_volume()
+    df["OBV_ema"] = df["OBV"].ewm(span=20).mean()
+
+    # ADX + directional indicators (+DI, -DI)
+    adx_obj      = ta.trend.ADXIndicator(high, low, close, window=14)
+    df["ADX"]    = adx_obj.adx()
+    df["ADX_pos"] = adx_obj.adx_pos()   # +DI
+    df["ADX_neg"] = adx_obj.adx_neg()   # -DI
+
+    # ATR (14) — volatility
+    df["ATR"] = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range()
+    df["ATR_pct"] = df["ATR"] / close * 100   # ATR as % of price
+
+    # Candle body analysis
+    df["Body"]       = (close - df["Open"]).abs()
+    df["Upper_wick"] = high  - close.where(close >= df["Open"], df["Open"])
+    df["Lower_wick"] = close.where(close >= df["Open"], df["Open"]) - low
+    df["Is_doji"]    = df["Body"] < (df["ATR"] * 0.1)  # tiny body = indecision
 
     return df
 
@@ -490,129 +533,281 @@ def candles_to_timestr(candles: float, interval: str) -> str:
 
 # ── Signal logic ─────────────────────────────────────────────────────────────
 def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
-    r = df.iloc[-1]   # latest candle
-    p = df.iloc[-2]   # previous candle
+    r  = df.iloc[-1]    # latest candle
+    p  = df.iloc[-2]    # previous candle
+    p2 = df.iloc[-3]    # two candles back
 
-    buy_pts  = 0
-    sell_pts = 0
+    buy_pts  = 0.0
+    sell_pts = 0.0
     buy_reasons  = []
     sell_reasons = []
 
-    # 1. RSI
-    rsi = r["RSI"]
-    if rsi < 35:
-        buy_pts += 2
-        buy_reasons.append(f"RSI oversold ({rsi:.1f})")
-    elif rsi > 65:
-        sell_pts += 2
-        sell_reasons.append(f"RSI overbought ({rsi:.1f})")
+    price   = float(r["Close"])
+    atr_val = float(r["ATR"]) if (not pd.isna(r["ATR"]) and r["ATR"] > 0) else price * 0.01
+    adx     = float(r["ADX"]) if not pd.isna(r["ADX"]) else 15.0
 
-    # 2. MACD crossover
-    if p["MACD"] < p["MACD_sig"] and r["MACD"] > r["MACD_sig"]:
-        buy_pts += 2
-        buy_reasons.append("MACD bullish crossover")
-    elif p["MACD"] > p["MACD_sig"] and r["MACD"] < r["MACD_sig"]:
-        sell_pts += 2
-        sell_reasons.append("MACD bearish crossover")
-    elif r["MACD_hist"] > 0:
-        buy_pts += 1
-    else:
-        sell_pts += 1
+    # ADX multiplier: strong trend = indicators more reliable
+    # ADX < 20 → weak/ranging (scale down trend signals)
+    # ADX > 30 → strong trend (scale up trend signals)
+    adx_mult = max(0.6, min(adx / 25.0, 1.6))
+    trend_strong = adx > 25
 
-    # 3. Moving average alignment
-    price = r["Close"]
-    if price > r["EMA20"] > r["EMA50"]:
-        buy_pts += 2
+    # ── 1. TREND DIRECTION (weight: 3) ─────────────────────────────────────
+    # Full EMA stack: price > EMA9 > EMA20 > EMA50 = strong uptrend
+    ema9  = float(r["EMA9"])
+    ema20 = float(r["EMA20"])
+    ema50 = float(r["EMA50"])
+
+    if price > ema9 > ema20 > ema50:
+        pts = 3.0 * adx_mult
+        buy_pts += pts
+        buy_reasons.append(f"Full EMA stack bullish (9>20>50, ADX {adx:.0f})")
+    elif price < ema9 < ema20 < ema50:
+        pts = 3.0 * adx_mult
+        sell_pts += pts
+        sell_reasons.append(f"Full EMA stack bearish (9<20<50, ADX {adx:.0f})")
+    elif price > ema20 > ema50:
+        pts = 2.0 * adx_mult
+        buy_pts += pts
         buy_reasons.append("Price above EMA20 > EMA50 (uptrend)")
-    elif price < r["EMA20"] < r["EMA50"]:
-        sell_pts += 2
+    elif price < ema20 < ema50:
+        pts = 2.0 * adx_mult
+        sell_pts += pts
         sell_reasons.append("Price below EMA20 < EMA50 (downtrend)")
 
+    # SMA200 — long-term bias filter (weight: 1)
     if not pd.isna(r["SMA200"]):
-        if price > r["SMA200"]:
-            buy_pts += 1
+        sma200 = float(r["SMA200"])
+        if price > sma200:
+            buy_pts += 1.0
         else:
-            sell_pts += 1
+            sell_pts += 1.5   # slight penalty for being below long-term trend
 
-    # 4. Bollinger Bands
-    if price <= r["BB_low"]:
-        buy_pts += 1
-        buy_reasons.append("Price at lower Bollinger Band (oversold)")
-    elif price >= r["BB_up"]:
-        sell_pts += 1
-        sell_reasons.append("Price at upper Bollinger Band (overbought)")
+    # EMA crossover: EMA9 crossing EMA20 (weight: 2)
+    if float(p["EMA9"]) <= float(p["EMA20"]) and ema9 > ema20:
+        buy_pts += 2.0
+        buy_reasons.append("EMA9 crossed above EMA20 (fresh bullish cross)")
+    elif float(p["EMA9"]) >= float(p["EMA20"]) and ema9 < ema20:
+        sell_pts += 2.0
+        sell_reasons.append("EMA9 crossed below EMA20 (fresh bearish cross)")
 
-    # 5. Volume confirmation
-    vol_ratio = r["Volume"] / r["Vol_avg"] if r["Vol_avg"] > 0 else 1
+    # ── 2. MOMENTUM — RSI (weight: 2) ──────────────────────────────────────
+    rsi        = float(r["RSI_smooth"])
+    rsi_raw    = float(r["RSI"])
+    rsi_prev   = float(p["RSI_smooth"])
+
+    if rsi < 30:
+        buy_pts += 2.5
+        buy_reasons.append(f"RSI deeply oversold ({rsi_raw:.1f})")
+    elif rsi < 40:
+        buy_pts += 1.5
+        buy_reasons.append(f"RSI oversold ({rsi_raw:.1f})")
+    elif rsi > 70:
+        sell_pts += 2.5
+        sell_reasons.append(f"RSI deeply overbought ({rsi_raw:.1f})")
+    elif rsi > 60:
+        sell_pts += 1.5
+        sell_reasons.append(f"RSI overbought ({rsi_raw:.1f})")
+
+    # RSI direction (rising from oversold / falling from overbought)
+    if rsi < 50 and rsi > rsi_prev:
+        buy_pts += 0.5   # momentum turning up
+    elif rsi > 50 and rsi < rsi_prev:
+        sell_pts += 0.5  # momentum turning down
+
+    # ── 3. MOMENTUM — Stochastic RSI (weight: 1.5) ─────────────────────────
+    stoch_k = float(r["StochRSI_K"]) if not pd.isna(r["StochRSI_K"]) else 0.5
+    stoch_d = float(r["StochRSI_D"]) if not pd.isna(r["StochRSI_D"]) else 0.5
+    p_stoch_k = float(p["StochRSI_K"]) if not pd.isna(p["StochRSI_K"]) else 0.5
+    p_stoch_d = float(p["StochRSI_D"]) if not pd.isna(p["StochRSI_D"]) else 0.5
+
+    if stoch_k < 0.2 and stoch_k > stoch_d and p_stoch_k <= p_stoch_d:
+        buy_pts += 1.5
+        buy_reasons.append(f"StochRSI bullish cross in oversold zone ({stoch_k:.2f})")
+    elif stoch_k > 0.8 and stoch_k < stoch_d and p_stoch_k >= p_stoch_d:
+        sell_pts += 1.5
+        sell_reasons.append(f"StochRSI bearish cross in overbought zone ({stoch_k:.2f})")
+    elif stoch_k < 0.2:
+        buy_pts += 0.75
+    elif stoch_k > 0.8:
+        sell_pts += 0.75
+
+    # ── 4. MACD (weight: 2) ─────────────────────────────────────────────────
+    macd_hist       = float(r["MACD_hist"])
+    macd_hist_prev  = float(p["MACD_hist"])
+    macd_hist_slope = float(r["MACD_hist_slope"]) if not pd.isna(r["MACD_hist_slope"]) else 0
+
+    # Crossover (highest weight)
+    if float(p["MACD"]) < float(p["MACD_sig"]) and float(r["MACD"]) > float(r["MACD_sig"]):
+        buy_pts += 2.0
+        buy_reasons.append("MACD bullish crossover")
+    elif float(p["MACD"]) > float(p["MACD_sig"]) and float(r["MACD"]) < float(r["MACD_sig"]):
+        sell_pts += 2.0
+        sell_reasons.append("MACD bearish crossover")
+
+    # Histogram momentum (rising above zero = bullish thrust)
+    if macd_hist > 0 and macd_hist_slope > 0:
+        buy_pts += 1.0
+        buy_reasons.append("MACD histogram rising (bullish momentum building)")
+    elif macd_hist < 0 and macd_hist_slope < 0:
+        sell_pts += 1.0
+        sell_reasons.append("MACD histogram falling (bearish momentum building)")
+    elif macd_hist > 0:
+        buy_pts += 0.5
+    else:
+        sell_pts += 0.5
+
+    # ── 5. BOLLINGER BANDS + SQUEEZE (weight: 1.5) ──────────────────────────
+    bb_pct   = float(r["BB_pct"])   if not pd.isna(r["BB_pct"])   else 0.5
+    bb_width = float(r["BB_width"]) if not pd.isna(r["BB_width"]) else 0.0
+    bb_width_avg = df["BB_width"].rolling(20).mean().iloc[-1]
+
+    # Band squeeze: narrow bands = breakout coming — wait for direction
+    squeeze = (not pd.isna(bb_width_avg)) and (bb_width < float(bb_width_avg) * 0.7)
+
+    if bb_pct <= 0.05:
+        pts = 1.5 if not squeeze else 0.5   # reduce pts in squeeze (false signal risk)
+        buy_pts += pts
+        buy_reasons.append("Price at/below lower Bollinger Band")
+    elif bb_pct >= 0.95:
+        pts = 1.5 if not squeeze else 0.5
+        sell_pts += pts
+        sell_reasons.append("Price at/above upper Bollinger Band")
+    elif bb_pct < 0.3 and float(p["BB_pct"]) < bb_pct:
+        buy_pts += 0.5   # price rising from lower band
+    elif bb_pct > 0.7 and float(p["BB_pct"]) > bb_pct:
+        sell_pts += 0.5  # price falling from upper band
+
+    if squeeze:
+        buy_reasons.append("⚡ BB squeeze — breakout likely, direction unconfirmed") if buy_pts > sell_pts else sell_reasons.append("⚡ BB squeeze — breakout likely, direction unconfirmed")
+
+    # ── 6. WILLIAMS %R (weight: 1) ─────────────────────────────────────────
+    wr = float(r["WilliamsR"]) if not pd.isna(r["WilliamsR"]) else -50.0
+    if wr < -80:
+        buy_pts += 1.0
+        buy_reasons.append(f"Williams %R oversold ({wr:.0f})")
+    elif wr > -20:
+        sell_pts += 1.0
+        sell_reasons.append(f"Williams %R overbought ({wr:.0f})")
+
+    # ── 7. VOLUME + OBV (weight: 1.5) ────────────────────────────────────────
+    vol_ratio = float(r["Vol_ratio"]) if not pd.isna(r["Vol_ratio"]) else 1.0
+
+    # OBV trend: OBV above its EMA = accumulation (smart money buying)
+    obv      = float(r["OBV"])
+    obv_ema  = float(r["OBV_ema"]) if not pd.isna(r["OBV_ema"]) else obv
+    obv_bull = obv > obv_ema
+
     if vol_ratio > 1.5:
-        if buy_pts > sell_pts:
-            buy_pts += 1
-            buy_reasons.append(f"High volume ({vol_ratio:.1f}x avg) confirms BUY")
+        if buy_pts > sell_pts and obv_bull:
+            buy_pts += 1.5
+            buy_reasons.append(f"High volume ({vol_ratio:.1f}x) + OBV accumulation")
+        elif sell_pts > buy_pts and not obv_bull:
+            sell_pts += 1.5
+            sell_reasons.append(f"High volume ({vol_ratio:.1f}x) + OBV distribution")
+        elif buy_pts > sell_pts:
+            buy_pts += 0.75
         elif sell_pts > buy_pts:
-            sell_pts += 1
-            sell_reasons.append(f"High volume ({vol_ratio:.1f}x avg) confirms SELL")
+            sell_pts += 0.75
+    elif obv_bull:
+        buy_pts += 0.5
+    else:
+        sell_pts += 0.5
 
-    # 6. ADX trend strength
-    adx = r["ADX"]
-    trend_strong = not pd.isna(adx) and adx > 25
+    # ── 8. CANDLESTICK PATTERNS (weight: 1) ─────────────────────────────────
+    body   = float(r["Body"])
+    lwick  = float(r["Lower_wick"])
+    uwick  = float(r["Upper_wick"])
+    is_doji = bool(r["Is_doji"])
+    candle_range = float(r["High"]) - float(r["Low"])
 
-    # ── Price projections — prefer S/R levels over flat ATR ──
-    atr = r["ATR"]
-    atr_val = float(atr) if (not pd.isna(atr) and atr > 0) else float(price) * 0.01
-    sr      = find_support_resistance(df, float(price), atr_val)
+    if candle_range > 0:
+        # Hammer: small body, long lower wick (≥2×body), at support
+        if lwick >= 2 * body and uwick < body and float(r["Open"]) > float(r["Close"]):
+            buy_pts += 1.0
+            buy_reasons.append("Hammer candle (reversal signal)")
+        # Shooting star: small body, long upper wick, at resistance
+        elif uwick >= 2 * body and lwick < body and float(r["Close"]) < float(r["Open"]):
+            sell_pts += 1.0
+            sell_reasons.append("Shooting star candle (reversal signal)")
+        # Engulfing
+        prev_body = abs(float(p["Close"]) - float(p["Open"]))
+        curr_body = abs(float(r["Close"]) - float(r["Open"]))
+        if (float(p["Close"]) < float(p["Open"]) and   # prev bearish
+                float(r["Close"]) > float(r["Open"]) and   # curr bullish
+                curr_body > prev_body * 1.2):
+            buy_pts += 1.0
+            buy_reasons.append("Bullish engulfing candle")
+        elif (float(p["Close"]) > float(p["Open"]) and  # prev bullish
+                float(r["Close"]) < float(r["Open"]) and  # curr bearish
+                curr_body > prev_body * 1.2):
+            sell_pts += 1.0
+            sell_reasons.append("Bearish engulfing candle")
+        # Doji at extreme = indecision/reversal warning
+        if is_doji and rsi < 35:
+            buy_pts += 0.5
+            buy_reasons.append("Doji at oversold level (potential reversal)")
+        elif is_doji and rsi > 65:
+            sell_pts += 0.5
+            sell_reasons.append("Doji at overbought level (potential reversal)")
 
+    # ── Support / Resistance ─────────────────────────────────────────────────
+    sr          = find_support_resistance(df, price, atr_val)
     nearest_res = sr["nearest_res"]
     nearest_sup = sr["nearest_sup"]
 
-    # Upside target: nearest resistance, else 2×ATR (clipped at BB upper)
+    # Near support bounce
+    if nearest_sup and (price - nearest_sup) / atr_val < 1.5:
+        buy_pts += 1.0
+        buy_reasons.append(f"Near support ₹{nearest_sup:,.2f} (bounce zone)")
+
+    # Near resistance rejection
+    if nearest_res and (nearest_res - price) / atr_val < 1.0:
+        sell_pts += 1.0
+        sell_reasons.append(f"Near resistance ₹{nearest_res:,.2f} (rejection risk)")
+
+    # ── Price projections ────────────────────────────────────────────────────
     if nearest_res:
-        proj_up      = nearest_res
-        proj_up_src  = f"R ₹{nearest_res:,.2f}"
-        # bonus point if price is bouncing off support toward resistance
-        if nearest_sup and (price - nearest_sup) / atr_val < 1.0:
-            buy_pts += 1
-            buy_reasons.append(f"Near support ₹{nearest_sup:,.2f} (bounce zone)")
+        proj_up     = nearest_res
+        proj_up_src = f"R ₹{nearest_res:,.2f}"
     else:
-        atr_up      = price + 2.0 * atr_val
-        bb_up_val   = float(r["BB_up"])
-        proj_up     = bb_up_val if (price < bb_up_val < atr_up) else atr_up
+        proj_up     = price + 2.0 * atr_val
         proj_up_src = "ATR"
 
-    # Downside stop: nearest support, else 1.5×ATR (clipped at BB lower)
     if nearest_sup:
-        proj_down      = nearest_sup
-        proj_down_src  = f"S ₹{nearest_sup:,.2f}"
-        # penalty if price is right at resistance (likely to reject)
-        if nearest_res and (nearest_res - price) / atr_val < 0.5:
-            sell_pts += 1
-            sell_reasons.append(f"Near resistance ₹{nearest_res:,.2f} (rejection risk)")
+        proj_down     = nearest_sup
+        proj_down_src = f"S ₹{nearest_sup:,.2f}"
     else:
-        atr_down      = price - 1.5 * atr_val
-        bb_low_val    = float(r["BB_low"])
-        proj_down     = bb_low_val if (price > bb_low_val > atr_down) else atr_down
+        proj_down     = price - 1.5 * atr_val
         proj_down_src = "ATR"
 
-    proj_up_pct   = (proj_up   - float(price)) / float(price) * 100
-    proj_down_pct = (proj_down - float(price)) / float(price) * 100
+    proj_up_pct   = (proj_up   - price) / price * 100
+    proj_down_pct = (proj_down - price) / price * 100
+
+    # Risk:Reward ratio
+    rr_ratio = abs(proj_up_pct / proj_down_pct) if proj_down_pct != 0 else 0
 
     # Timeline
-    adx_val = float(adx) if not pd.isna(adx) else 20.0
-    momentum_factor = 0.15 + min(adx_val / 100, 0.30)
-    candles_up    = (proj_up - price) / (atr_val * momentum_factor)
-    proj_timeline = candles_to_timestr(candles_up, interval)
+    momentum_factor = 0.15 + min(adx / 100, 0.30)
+    candles_up      = (proj_up - price) / (atr_val * momentum_factor)
+    proj_timeline   = candles_to_timestr(candles_up, interval)
 
-    # ── Final verdict ──
+    # ── Final verdict ─────────────────────────────────────────────────────────
     total = buy_pts + sell_pts
     score = (buy_pts / total * 100) if total > 0 else 50
 
-    if score >= 65:
+    # Require minimum R:R of 1.5 for a BUY signal
+    if score >= 60 and rr_ratio < 1.5:
+        score = min(score, 62)   # cap at HOLD boundary unless R:R is good
+
+    if score >= 62:
         signal = "BUY"
-    elif score <= 35:
+    elif score <= 38:
         signal = "SELL"
     else:
         signal = "HOLD"
 
-    # Show reasons matching the signal; append conflicting signals as a caution
+    # Assemble reason list
     if signal == "BUY":
         reasons = buy_reasons
         if sell_reasons:
@@ -621,23 +816,24 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
         reasons = sell_reasons
         if buy_reasons:
             reasons = reasons + [f"⚠ Against: {', '.join(buy_reasons)}"]
-    else:  # HOLD — show both sides
-        reasons = ([f"▲ {r}" for r in buy_reasons] +
-                   [f"▼ {r}" for r in sell_reasons])
+    else:
+        reasons = ([f"▲ {r_}" for r_ in buy_reasons] +
+                   [f"▼ {r_}" for r_ in sell_reasons])
 
     return {
-        "price":         round(float(price), 2),
-        "signal":        signal,
-        "score":         round(score, 1),
-        "buy_pts":       buy_pts,
-        "sell_pts":      sell_pts,
-        "rsi":           round(float(rsi), 1),
-        "adx":           round(float(adx), 1) if not pd.isna(adx) else None,
-        "trend_strong":  trend_strong,
-        "vol_ratio":     round(vol_ratio, 2),
-        "reasons":       reasons,
-        "proj_up":        round(float(proj_up), 2),
-        "proj_down":      round(float(proj_down), 2),
+        "price":          round(price, 2),
+        "signal":         signal,
+        "score":          round(score, 1),
+        "buy_pts":        round(buy_pts, 1),
+        "sell_pts":       round(sell_pts, 1),
+        "rsi":            round(rsi_raw, 1),
+        "adx":            round(adx, 1) if not pd.isna(r["ADX"]) else None,
+        "trend_strong":   trend_strong,
+        "vol_ratio":      round(vol_ratio, 2),
+        "rr_ratio":       round(rr_ratio, 2),
+        "reasons":        reasons,
+        "proj_up":        round(proj_up, 2),
+        "proj_down":      round(proj_down, 2),
         "proj_up_pct":    round(proj_up_pct, 1),
         "proj_down_pct":  round(proj_down_pct, 1),
         "proj_timeline":  proj_timeline,
@@ -731,10 +927,11 @@ def scan(tickers: list[str], interval: str, top: int | None) -> None:
             str(r["adx"]) if r["adx"] else "—",
             f"{r['vol_ratio']}x",
             "✅ Strong" if r["trend_strong"] else "Weak",
+            f"{r['rr_ratio']:.1f}:1" if r.get("rr_ratio") else "—",
             proj_str,
         ])
 
-    headers = ["Ticker", "Price (₹)", "Signal", "Score", "RSI", "ADX", "Vol Ratio", "Trend", "Projection"]
+    headers = ["Ticker", "Price (₹)", "Signal", "Score", "RSI", "ADX", "Vol Ratio", "Trend", "R:R", "Projection"]
     print(tabulate(rows, headers=headers, tablefmt="rounded_outline"))
 
     # Print reasons for BUY/SELL
