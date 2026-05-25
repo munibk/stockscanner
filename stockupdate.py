@@ -110,7 +110,23 @@ def fetch_zerodha_holdings() -> list[str]:
     kite      = KiteConnect(api_key=api_key)
     kite.set_access_token(_load_access_token())
 
-    tickers = set()   # (symbol, exchange) pairs
+    return _zerodha_tickers_from_kite(kite)
+
+
+def fetch_zerodha_holdings_with_token(api_key: str, access_token: str) -> list[str]:
+    """
+    Like fetch_zerodha_holdings but takes credentials directly (no config files).
+    Used by the Streamlit UI so it works on the cloud without zerodha.cfg.
+    """
+    from kiteconnect import KiteConnect
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
+    return _zerodha_tickers_from_kite(kite)
+
+
+def _zerodha_tickers_from_kite(kite) -> list[str]:
+    """Shared logic: extract NSE/BSE tickers from holdings + open positions."""
+    tickers = set()
 
     # Long-term holdings
     for h in kite.holdings():

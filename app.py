@@ -21,6 +21,7 @@ from stockupdate import (
     compute_indicators,
     generate_signal,
     fetch_zerodha_holdings,
+    fetch_zerodha_holdings_with_token,
     _NewlyListedError,
     MIN_ROWS,
 )
@@ -81,8 +82,42 @@ with st.sidebar:
 
     _mode_options = ["Nifty 50", "Custom Tickers"] + (["Zerodha Portfolio"] if _kite_available else [])
     mode = st.radio("Stock List", _mode_options, index=0)
-    if not _kite_available:
-        st.caption("ℹ️ Zerodha Portfolio unavailable — kiteconnect not installed.")
+
+    # ── Zerodha: show login link + request_token input ──
+    if mode == "Zerodha Portfolio":
+        _has_secrets = "kite" in st.secrets if hasattr(st, "secrets") else False
+        if _has_secrets:
+            _api_key    = st.secrets["kite"]["api_key"]
+            _api_secret = st.secrets["kite"]["api_secret"]
+        else:
+            # Fallback: read from local zerodha.cfg
+            import configparser as _cp
+            _cfg = _cp.ConfigParser()
+            _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zerodha.cfg")
+            _cfg.read(_cfg_path)
+            _api_key    = _cfg.get("kite", "api_key", fallback="")
+            _api_secret = _cfg.get("kite", "api_secret", fallback="")
+
+        if _api_key and _api_key != "YOUR_API_KEY":
+            from kiteconnect import KiteConnect as _KC
+            _kite_tmp  = _KC(api_key=_api_key)
+            _login_url = _kite_tmp.login_url()
+            st.markdown(f"**Step 1:** [Click here to login to Zerodha]({_login_url})")
+            st.caption("After login, you'll be redirected. Copy the `request_token` from the URL.")
+            _req_token = st.text_input("Step 2: Paste request_token here", key="kite_req_token",
+                                        placeholder="abc123xyz...")
+            if _req_token and "kite_access_token" not in st.session_state:
+                try:
+                    _sess = _kite_tmp.generate_session(_req_token, api_secret=_api_secret)
+                    st.session_state["kite_access_token"] = _sess["access_token"]
+                    st.session_state["kite_api_key"]      = _api_key
+                    st.success("✅ Zerodha login successful!")
+                except Exception as _e:
+                    st.error(f"Login failed: {_e}")
+            elif "kite_access_token" in st.session_state:
+                st.success("✅ Already logged in for this session.")
+        else:
+            st.warning("Add `kite.api_key` and `kite.api_secret` to Streamlit secrets (Settings → Secrets).")
 
     custom_input = ""
     if mode == "Custom Tickers":
@@ -108,7 +143,7 @@ with st.sidebar:
     run = st.button("🔍 Run Scan", width="stretch", type="primary")
 
     st.divider()
-    st.caption("ℹ️ For Zerodha Portfolio, run `python stockupdate.py --zerodha-login` once daily first.")
+    st.caption("ℹ️ Zerodha Portfolio: add api_key & api_secret to Streamlit Secrets, then log in from the sidebar.")
 
 # ── Welcome screen ────────────────────────────────────────────────────────────
 if not run:
@@ -134,10 +169,19 @@ elif mode == "Custom Tickers":
         st.stop()
 
 else:  # Zerodha Portfolio
+    if "kite_access_token" not in st.session_state:
+        st.warning("Please log in to Zerodha using the sidebar first.")
+        st.stop()
     try:
-        tickers = fetch_zerodha_holdings()
-    except SystemExit:
-        st.error("Zerodha Portfolio is not available on the cloud deployment (requires kiteconnect + local login). Use **Nifty 50** or **Custom Tickers** instead.")
+        tickers = fetch_zerodha_holdings_with_token(
+            st.session_state["kite_api_key"],
+            st.session_state["kite_access_token"],
+        )
+    except Exception as e:
+        st.error(f"Failed to fetch Zerodha holdings: {e}")
+        st.stop()
+    if not tickers:
+        st.warning("No holdings or open positions found in your Zerodha account.")
         st.stop()
 
 # ── Scan ──────────────────────────────────────────────────────────────────────
