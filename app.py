@@ -132,7 +132,7 @@ else:  # Zerodha Portfolio
     try:
         tickers = fetch_zerodha_holdings()
     except SystemExit:
-        st.error("No valid Zerodha token found. Run `python stockupdate.py --zerodha-login` first.")
+        st.error("Zerodha Portfolio is not available on the cloud deployment (requires kiteconnect + local login). Use **Nifty 50** or **Custom Tickers** instead.")
         st.stop()
 
 # ── Scan ──────────────────────────────────────────────────────────────────────

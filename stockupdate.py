@@ -62,7 +62,7 @@ def zerodha_login() -> None:
     try:
         from kiteconnect import KiteConnect
     except ImportError:
-        print(Fore.RED + "  kiteconnect not installed. Run: pip install kiteconnect" + Style.RESET_ALL)
+        print("  kiteconnect not installed. Run: pip install kiteconnect")
         sys.exit(1)
 
     cfg        = _ensure_config()
@@ -103,8 +103,7 @@ def fetch_zerodha_holdings() -> list[str]:
     try:
         from kiteconnect import KiteConnect
     except ImportError:
-        print(Fore.RED + "  kiteconnect not installed. Run: pip install kiteconnect" + Style.RESET_ALL)
-        sys.exit(1)
+        sys.exit(1)  # caught by app.py; st.error() shown there
 
     cfg       = _ensure_config()
     api_key   = cfg["kite"]["api_key"].strip()
