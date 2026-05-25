@@ -101,21 +101,34 @@ with st.sidebar:
         if _api_key and _api_key != "YOUR_API_KEY":
             from kiteconnect import KiteConnect as _KC
             _kite_tmp  = _KC(api_key=_api_key)
-            _login_url = _kite_tmp.login_url()
-            st.markdown(f"**Step 1:** [Click here to login to Zerodha]({_login_url})")
-            st.caption("After login, you'll be redirected. Copy the `request_token` from the URL.")
-            _req_token = st.text_input("Step 2: Paste request_token here", key="kite_req_token",
-                                        placeholder="abc123xyz...")
-            if _req_token and "kite_access_token" not in st.session_state:
-                try:
-                    _sess = _kite_tmp.generate_session(_req_token, api_secret=_api_secret)
-                    st.session_state["kite_access_token"] = _sess["access_token"]
-                    st.session_state["kite_api_key"]      = _api_key
-                    st.success("✅ Zerodha login successful!")
-                except Exception as _e:
-                    st.error(f"Login failed: {_e}")
-            elif "kite_access_token" in st.session_state:
-                st.success("✅ Already logged in for this session.")
+
+            if "kite_access_token" in st.session_state:
+                st.success("✅ Logged in for this session.")
+                if st.button("🔓 Logout / use new token", key="kite_logout"):
+                    del st.session_state["kite_access_token"]
+                    del st.session_state["kite_api_key"]
+                    st.rerun()
+            else:
+                _login_url = _kite_tmp.login_url()
+                st.markdown(f"**Step 1:** [Open Zerodha login ↗]({_login_url})")
+                st.caption("After login, copy the `request_token=...` value from the redirect URL.")
+                _req_token = st.text_input(
+                    "Step 2: Paste request_token",
+                    key="kite_req_token",
+                    placeholder="abc123xyz...",
+                )
+                if st.button("🔑 Connect", key="kite_connect", type="primary",
+                             disabled=not bool(_req_token)):
+                    try:
+                        _sess = _kite_tmp.generate_session(
+                            _req_token.strip(), api_secret=_api_secret
+                        )
+                        st.session_state["kite_access_token"] = _sess["access_token"]
+                        st.session_state["kite_api_key"]      = _api_key
+                        st.rerun()
+                    except Exception as _e:
+                        st.error(f"Login failed: {_e}")
+                        st.caption("⚠️ request_token is single-use. Go back to Step 1 and get a fresh token.")
         else:
             st.warning("Add `kite.api_key` and `kite.api_secret` to Streamlit secrets (Settings → Secrets).")
 
