@@ -33,7 +33,6 @@ import time
 import pandas as pd
 import requests
 import yfinance as yf
-import ta
 from colorama import Fore, Style, init
 from tabulate import tabulate
 
@@ -458,69 +457,96 @@ def find_support_resistance(df: pd.DataFrame, price: float, atr: float) -> dict:
         "nearest_sup": max(supports,    key=lambda v: v)         if supports    else None,
     }
 
-# ── Indicator calculation ───────────────────────────────────────────────────
+# ── Indicator calculation (pure pandas/numpy — no external ta library) ────────
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     close = df["Close"]
     high  = df["High"]
     low   = df["Low"]
     vol   = df["Volume"]
+    open_ = df["Open"]
 
-    # RSI (14) + smoothed RSI to reduce whipsaws
-    df["RSI"] = ta.momentum.RSIIndicator(close, window=14).rsi()
+    # ── RSI (14) ──────────────────────────────────────────────────────────────
+    delta     = close.diff()
+    gain      = delta.clip(lower=0)
+    loss      = (-delta).clip(lower=0)
+    avg_gain  = gain.ewm(com=13, adjust=False).mean()
+    avg_loss  = loss.ewm(com=13, adjust=False).mean()
+    rs        = avg_gain / avg_loss.replace(0, float("nan"))
+    df["RSI"]        = 100 - (100 / (1 + rs))
     df["RSI_smooth"] = df["RSI"].ewm(span=3).mean()
 
-    # MACD (standard 12/26/9)
-    macd_obj        = ta.trend.MACD(close)
-    df["MACD"]      = macd_obj.macd()
-    df["MACD_sig"]  = macd_obj.macd_signal()
-    df["MACD_hist"] = macd_obj.macd_diff()
-    # Histogram slope: rising = momentum building
+    # ── MACD (12 / 26 / 9) ───────────────────────────────────────────────────
+    ema12             = close.ewm(span=12, adjust=False).mean()
+    ema26             = close.ewm(span=26, adjust=False).mean()
+    df["MACD"]        = ema12 - ema26
+    df["MACD_sig"]    = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_hist"]   = df["MACD"] - df["MACD_sig"]
     df["MACD_hist_slope"] = df["MACD_hist"].diff()
 
-    # Moving averages
-    df["EMA9"]   = ta.trend.EMAIndicator(close, window=9).ema_indicator()
-    df["EMA20"]  = ta.trend.EMAIndicator(close, window=20).ema_indicator()
-    df["EMA50"]  = ta.trend.EMAIndicator(close, window=50).ema_indicator()
-    df["SMA200"] = ta.trend.SMAIndicator(close, window=200).sma_indicator()
+    # ── Moving averages ───────────────────────────────────────────────────────
+    df["EMA9"]   = close.ewm(span=9,   adjust=False).mean()
+    df["EMA20"]  = close.ewm(span=20,  adjust=False).mean()
+    df["EMA50"]  = close.ewm(span=50,  adjust=False).mean()
+    df["SMA200"] = close.rolling(200).mean()
 
-    # Bollinger Bands (20,2) + %B position within bands
-    bb            = ta.volatility.BollingerBands(close, window=20, window_dev=2)
-    df["BB_up"]   = bb.bollinger_hband()
-    df["BB_low"]  = bb.bollinger_lband()
-    df["BB_mid"]  = bb.bollinger_mavg()
-    df["BB_pct"]  = bb.bollinger_pband()    # 0=lower, 0.5=mid, 1=upper
-    df["BB_width"] = (df["BB_up"] - df["BB_low"]) / df["BB_mid"]  # band width as % of mid
+    # ── Bollinger Bands (20, 2) ───────────────────────────────────────────────
+    sma20          = close.rolling(20).mean()
+    std20          = close.rolling(20).std()
+    df["BB_mid"]   = sma20
+    df["BB_up"]    = sma20 + 2 * std20
+    df["BB_low"]   = sma20 - 2 * std20
+    band_width     = df["BB_up"] - df["BB_low"]
+    df["BB_pct"]   = (close - df["BB_low"]) / band_width.replace(0, float("nan"))
+    df["BB_width"] = band_width / sma20.replace(0, float("nan"))
 
-    # Stochastic RSI (more sensitive than plain RSI)
-    stoch = ta.momentum.StochRSIIndicator(close, window=14, smooth1=3, smooth2=3)
-    df["StochRSI_K"] = stoch.stochrsi_k()
-    df["StochRSI_D"] = stoch.stochrsi_d()
+    # ── ATR (14) ──────────────────────────────────────────────────────────────
+    tr             = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    df["ATR"]      = tr.ewm(com=13, adjust=False).mean()
+    df["ATR_pct"]  = df["ATR"] / close * 100
 
-    # Williams %R (overbought/oversold, -80 oversold, -20 overbought)
-    df["WilliamsR"] = ta.momentum.WilliamsRIndicator(high, low, close, lbp=14).williams_r()
+    # ── ADX (14) ──────────────────────────────────────────────────────────────
+    up_move   = high.diff()
+    down_move = (-low.diff())
+    plus_dm   = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm  = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    atr14     = tr.ewm(com=13, adjust=False).mean()
+    plus_di   = 100 * plus_dm.ewm(com=13,  adjust=False).mean() / atr14.replace(0, float("nan"))
+    minus_di  = 100 * minus_dm.ewm(com=13, adjust=False).mean() / atr14.replace(0, float("nan"))
+    dx        = (100 * (plus_di - minus_di).abs() /
+                 (plus_di + minus_di).replace(0, float("nan")))
+    df["ADX"]     = dx.ewm(com=13, adjust=False).mean()
+    df["ADX_pos"] = plus_di
+    df["ADX_neg"] = minus_di
 
-    # Volume analysis
+    # ── Stochastic RSI ────────────────────────────────────────────────────────
+    rsi_low   = df["RSI"].rolling(14).min()
+    rsi_high  = df["RSI"].rolling(14).max()
+    stoch_rsi = ((df["RSI"] - rsi_low) /
+                 (rsi_high - rsi_low).replace(0, float("nan")))
+    df["StochRSI_K"] = stoch_rsi.rolling(3).mean()
+    df["StochRSI_D"] = df["StochRSI_K"].rolling(3).mean()
+
+    # ── Williams %R (14) ─────────────────────────────────────────────────────
+    hh = high.rolling(14).max()
+    ll = low.rolling(14).min()
+    df["WilliamsR"] = -100 * (hh - close) / (hh - ll).replace(0, float("nan"))
+
+    # ── Volume ────────────────────────────────────────────────────────────────
     df["Vol_avg"]   = vol.rolling(20).mean()
     df["Vol_ratio"] = vol / df["Vol_avg"].replace(0, float("nan"))
-    # On-Balance Volume — accumulation vs distribution
-    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(close, vol).on_balance_volume()
-    df["OBV_ema"] = df["OBV"].ewm(span=20).mean()
+    direction       = close.diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+    df["OBV"]       = (vol * direction).cumsum()
+    df["OBV_ema"]   = df["OBV"].ewm(span=20).mean()
 
-    # ADX + directional indicators (+DI, -DI)
-    adx_obj      = ta.trend.ADXIndicator(high, low, close, window=14)
-    df["ADX"]    = adx_obj.adx()
-    df["ADX_pos"] = adx_obj.adx_pos()   # +DI
-    df["ADX_neg"] = adx_obj.adx_neg()   # -DI
-
-    # ATR (14) — volatility
-    df["ATR"] = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range()
-    df["ATR_pct"] = df["ATR"] / close * 100   # ATR as % of price
-
-    # Candle body analysis
-    df["Body"]       = (close - df["Open"]).abs()
-    df["Upper_wick"] = high  - close.where(close >= df["Open"], df["Open"])
-    df["Lower_wick"] = close.where(close >= df["Open"], df["Open"]) - low
-    df["Is_doji"]    = df["Body"] < (df["ATR"] * 0.1)  # tiny body = indecision
+    # ── Candle body analysis ──────────────────────────────────────────────────
+    df["Body"]       = (close - open_).abs()
+    df["Upper_wick"] = high  - close.where(close >= open_, open_)
+    df["Lower_wick"] = close.where(close >= open_, open_) - low
+    df["Is_doji"]    = df["Body"] < (df["ATR"] * 0.1)
 
     return df
 
