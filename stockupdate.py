@@ -577,30 +577,225 @@ def candles_to_timestr(candles: float, interval: str) -> str:
 
 # ── Signal logic ─────────────────────────────────────────────────────────────
 def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
-    r  = df.iloc[-1]    # latest candle
-    p  = df.iloc[-2]    # previous candle
-    p2 = df.iloc[-3]    # two candles back
+    r = df.iloc[-1]   # latest candle
+    p = df.iloc[-2]   # previous candle
 
-    buy_pts  = 0.0
-    sell_pts = 0.0
+    buy_pts  = 0
+    sell_pts = 0
     buy_reasons  = []
     sell_reasons = []
 
-    price   = float(r["Close"])
-    atr_val = float(r["ATR"]) if (not pd.isna(r["ATR"]) and r["ATR"] > 0) else price * 0.01
-    adx     = float(r["ADX"]) if not pd.isna(r["ADX"]) else 15.0
-
-    # ADX multiplier: strong trend = indicators more reliable
-    # ADX < 20 → weak/ranging (scale down trend signals)
-    # ADX > 30 → strong trend (scale up trend signals)
-    adx_mult = max(0.6, min(adx / 25.0, 1.6))
+    price = float(r["Close"])
+    adx   = float(r["ADX"]) if not pd.isna(r["ADX"]) else 15.0
     trend_strong = adx > 25
 
-    # ── 1. TREND DIRECTION (weight: 3) ─────────────────────────────────────
-    # Full EMA stack: price > EMA9 > EMA20 > EMA50 = strong uptrend
-    ema9  = float(r["EMA9"])
+    # 1. RSI
+    rsi = float(r["RSI"])
+    if rsi < 35:
+        buy_pts += 2
+        buy_reasons.append(f"RSI oversold ({rsi:.1f})")
+    elif rsi > 65:
+        sell_pts += 2
+        sell_reasons.append(f"RSI overbought ({rsi:.1f})")
+
+    # 2. MACD crossover
+    if float(p["MACD"]) < float(p["MACD_sig"]) and float(r["MACD"]) > float(r["MACD_sig"]):
+        buy_pts += 2
+        buy_reasons.append("MACD bullish crossover")
+    elif float(p["MACD"]) > float(p["MACD_sig"]) and float(r["MACD"]) < float(r["MACD_sig"]):
+        sell_pts += 2
+        sell_reasons.append("MACD bearish crossover")
+    elif float(r["MACD_hist"]) > 0:
+        buy_pts += 1
+    else:
+        sell_pts += 1
+
+    # 3. Moving average alignment
     ema20 = float(r["EMA20"])
     ema50 = float(r["EMA50"])
+    if price > ema20 > ema50:
+        buy_pts += 2
+        buy_reasons.append("Price above EMA20 > EMA50 (uptrend)")
+    elif price < ema20 < ema50:
+        sell_pts += 2
+        sell_reasons.append("Price below EMA20 < EMA50 (downtrend)")
+
+    if not pd.isna(r["SMA200"]):
+        if price > float(r["SMA200"]):
+            buy_pts += 1
+        else:
+            sell_pts += 1
+
+    # 4. Bollinger Bands
+    if price <= float(r["BB_low"]):
+        buy_pts += 1
+        buy_reasons.append("Price at lower Bollinger Band (oversold)")
+    elif price >= float(r["BB_up"]):
+        sell_pts += 1
+        sell_reasons.append("Price at upper Bollinger Band (overbought)")
+
+    # 5. Volume confirmation
+    vol_ratio = float(r["Vol_ratio"]) if not pd.isna(r["Vol_ratio"]) else 1.0
+    if vol_ratio > 1.5:
+        if buy_pts > sell_pts:
+            buy_pts += 1
+            buy_reasons.append(f"High volume ({vol_ratio:.1f}x avg) confirms BUY")
+        elif sell_pts > buy_pts:
+            sell_pts += 1
+            sell_reasons.append(f"High volume ({vol_ratio:.1f}x avg) confirms SELL")
+
+    # ── Price projections ─────────────────────────────────────────────────────
+    atr_val = float(r["ATR"]) if (not pd.isna(r["ATR"]) and r["ATR"] > 0) else price * 0.01
+    sr          = find_support_resistance(df, price, atr_val)
+    nearest_res = sr["nearest_res"]
+    nearest_sup = sr["nearest_sup"]
+
+    if nearest_res:
+        proj_up     = nearest_res
+        proj_up_src = f"R ₹{nearest_res:,.2f}"
+        if nearest_sup and (price - nearest_sup) / atr_val < 1.0:
+            buy_pts += 1
+            buy_reasons.append(f"Near support ₹{nearest_sup:,.2f} (bounce zone)")
+    else:
+        proj_up     = price + 2.0 * atr_val
+        proj_up_src = "ATR"
+
+    if nearest_sup:
+        proj_down     = nearest_sup
+        proj_down_src = f"S ₹{nearest_sup:,.2f}"
+        if nearest_res and (nearest_res - price) / atr_val < 0.5:
+            sell_pts += 1
+            sell_reasons.append(f"Near resistance ₹{nearest_res:,.2f} (rejection risk)")
+    else:
+        proj_down     = price - 1.5 * atr_val
+        proj_down_src = "ATR"
+
+    proj_up_pct   = (proj_up   - price) / price * 100
+    proj_down_pct = (proj_down - price) / price * 100
+
+    # Timeline
+    momentum_factor = 0.15 + min(adx / 100, 0.30)
+    candles_up      = (proj_up - price) / (atr_val * momentum_factor)
+    proj_timeline   = candles_to_timestr(candles_up, interval)
+
+    # ── Final verdict ─────────────────────────────────────────────────────────
+    total = buy_pts + sell_pts
+    score = (buy_pts / total * 100) if total > 0 else 50
+
+    if score >= 65:
+        signal = "BUY"
+    elif score <= 35:
+        signal = "SELL"
+    else:
+        signal = "HOLD"
+
+    if signal == "BUY":
+        reasons = buy_reasons
+        if sell_reasons:
+            reasons = reasons + [f"⚠ Against: {', '.join(sell_reasons)}"]
+    elif signal == "SELL":
+        reasons = sell_reasons
+        if buy_reasons:
+            reasons = reasons + [f"⚠ Against: {', '.join(buy_reasons)}"]
+    else:
+        reasons = ([f"▲ {r_}" for r_ in buy_reasons] +
+                   [f"▼ {r_}" for r_ in sell_reasons])
+
+    return {
+        "price":          round(price, 2),
+        "signal":         signal,
+        "score":          round(score, 1),
+        "buy_pts":        buy_pts,
+        "sell_pts":       sell_pts,
+        "rsi":            round(rsi, 1),
+        "adx":            round(adx, 1) if not pd.isna(r["ADX"]) else None,
+        "trend_strong":   trend_strong,
+        "vol_ratio":      round(vol_ratio, 2),
+        "reasons":        reasons,
+        "proj_up":        round(proj_up, 2),
+        "proj_down":      round(proj_down, 2),
+        "proj_up_pct":    round(proj_up_pct, 1),
+        "proj_down_pct":  round(proj_down_pct, 1),
+        "proj_timeline":  proj_timeline,
+        "proj_up_src":    proj_up_src,
+        "proj_down_src":  proj_down_src,
+        "resistances":    sr["resistance"],
+        "supports":       sr["support"],
+        "summary":        _build_summary(signal, score, rsi, adx, vol_ratio,
+                                         trend_strong, proj_up_pct, proj_down_pct,
+                                         proj_timeline, nearest_res, nearest_sup,
+                                         buy_reasons, sell_reasons),
+    }
+
+
+def _build_summary(signal, score, rsi, adx, vol_ratio, trend_strong,
+                   proj_up_pct, proj_down_pct, proj_timeline,
+                   nearest_res, nearest_sup, buy_reasons, sell_reasons) -> str:
+    """Plain-English explanation of the signal for non-technical readers."""
+    parts = []
+
+    # Trend
+    if trend_strong:
+        parts.append("The stock is in a strong trend")
+    else:
+        parts.append("The stock is moving sideways without a clear trend")
+
+    # RSI
+    if rsi < 35:
+        parts.append(f"and is oversold (RSI {rsi:.0f}), meaning it may have fallen too far and could bounce back")
+    elif rsi > 65:
+        parts.append(f"and is overbought (RSI {rsi:.0f}), meaning it has risen sharply and may be due for a pullback")
+    else:
+        parts.append(f"with neutral momentum (RSI {rsi:.0f})")
+
+    # Volume
+    if vol_ratio > 1.5:
+        parts.append(f"Trading volume is unusually high ({vol_ratio:.1f}× average), confirming the move.")
+    elif vol_ratio < 0.5:
+        parts.append("Volume is low, so the move may lack conviction.")
+
+    # Key reasons in plain English
+    reason_map = {
+        "Price above EMA20 > EMA50 (uptrend)":        "Short-term averages are stacked bullishly.",
+        "Price below EMA20 < EMA50 (downtrend)":      "Short-term averages are stacked bearishly.",
+        "MACD bullish crossover":                      "Momentum has just turned upward (MACD crossover).",
+        "MACD bearish crossover":                      "Momentum has just turned downward (MACD crossover).",
+        "Price at lower Bollinger Band (oversold)":    "Price is at the lower edge of its normal range.",
+        "Price at upper Bollinger Band (overbought)":  "Price is at the upper edge of its normal range.",
+    }
+    active_reasons = buy_reasons if signal in ("BUY", "HOLD") else sell_reasons
+    for raw in active_reasons:
+        plain = next((v for k, v in reason_map.items() if k in raw), None)
+        if plain:
+            parts.append(plain)
+
+    # Target / stop
+    if signal == "BUY":
+        parts.append(
+            f"If the stock moves as expected, it could rise ~{proj_up_pct:.1f}% "
+            f"in {proj_timeline}. Risk on the downside is ~{abs(proj_down_pct):.1f}%."
+        )
+        if nearest_res:
+            parts.append(f"The nearest resistance (sell zone) is ₹{nearest_res:,.2f}.")
+        if nearest_sup:
+            parts.append(f"A good stop-loss level would be around ₹{nearest_sup:,.2f}.")
+    elif signal == "SELL":
+        parts.append(
+            f"The stock could decline ~{abs(proj_down_pct):.1f}% from here. "
+            f"Upside risk if wrong is ~{proj_up_pct:.1f}%."
+        )
+        if nearest_res:
+            parts.append(f"Resistance above at ₹{nearest_res:,.2f} is likely to cap any bounce.")
+    else:
+        parts.append(
+            "There are mixed signals — no clear edge in either direction right now. "
+            "It may be safer to wait for a clearer setup before taking a position."
+        )
+
+    return " ".join(parts)
+
+
+# ── Colour helpers ────────────────────────────────────────────────────────────
 
     if price > ema9 > ema20 > ema50:
         pts = 3.0 * adx_mult
@@ -840,13 +1035,9 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
     total = buy_pts + sell_pts
     score = (buy_pts / total * 100) if total > 0 else 50
 
-    # Require minimum R:R of 1.5 for a BUY signal
-    if score >= 60 and rr_ratio < 1.5:
-        score = min(score, 62)   # cap at HOLD boundary unless R:R is good
-
-    if score >= 62:
+    if score >= 65:
         signal = "BUY"
-    elif score <= 38:
+    elif score <= 35:
         signal = "SELL"
     else:
         signal = "HOLD"
@@ -971,11 +1162,10 @@ def scan(tickers: list[str], interval: str, top: int | None) -> None:
             str(r["adx"]) if r["adx"] else "—",
             f"{r['vol_ratio']}x",
             "✅ Strong" if r["trend_strong"] else "Weak",
-            f"{r['rr_ratio']:.1f}:1" if r.get("rr_ratio") else "—",
             proj_str,
         ])
 
-    headers = ["Ticker", "Price (₹)", "Signal", "Score", "RSI", "ADX", "Vol Ratio", "Trend", "R:R", "Projection"]
+    headers = ["Ticker", "Price (₹)", "Signal", "Score", "RSI", "ADX", "Vol Ratio", "Trend", "Projection"]
     print(tabulate(rows, headers=headers, tablefmt="rounded_outline"))
 
     # Print reasons for BUY/SELL
@@ -992,6 +1182,8 @@ def scan(tickers: list[str], interval: str, top: int | None) -> None:
             if r["supports"]:
                 sup_str = "  ".join(f"₹{v:,.2f}" for v in r["supports"])
                 print(f"       {Fore.CYAN}Support zones:    {sup_str}{Style.RESET_ALL}")
+            if r.get("summary"):
+                print(f"       {Fore.WHITE}💬 {r['summary']}{Style.RESET_ALL}")
 
     # Summary
     buys  = sum(1 for r in results if r["signal"] == "BUY")

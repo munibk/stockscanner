@@ -214,7 +214,7 @@ for r in results:
             st.markdown(f"### {r['ticker']}")
             sig_color = {"BUY": "green", "SELL": "red", "HOLD": "orange"}[r["signal"]]
             st.markdown(f"**Signal:** :{sig_color}[{r['signal']}] &nbsp; Score: **{r['score']:.0f}/100**")
-            st.markdown(f"**RSI:** {r['rsi']}  |  **ADX:** {r['adx'] or '—'}  |  **Vol:** {r['vol_ratio']}x  |  **R:R:** {r.get('rr_ratio', 0):.1f}:1")
+            st.markdown(f"**RSI:** {r['rsi']}  |  **ADX:** {r['adx'] or '\u2014'}  |  **Vol:** {r['vol_ratio']}x")
             st.markdown("---")
             st.markdown(f"🎯 **Target:** ₹{r['proj_up']:,.2f}  ({r['proj_up_pct']:+.1f}%)  *{r['proj_timeline']}*")
             st.markdown(f"🛑 **Stop:**   ₹{r['proj_down']:,.2f}  ({r['proj_down_pct']:+.1f}%)")
@@ -223,6 +223,10 @@ for r in results:
             if r["supports"]:
                 st.markdown("🟢 **Support:**    " + " | ".join(f"₹{v:,.2f}" for v in r["supports"]))
             st.markdown("---")
+            if r.get("summary"):
+                icon = "🟢" if r["signal"] == "BUY" else ("🔴" if r["signal"] == "SELL" else "🟡")
+                st.info(f"{icon} **In plain English:** {r['summary']}")
+                st.markdown("---")
             st.markdown("**Reasons:**")
             for reason in r["reasons"]:
                 # strip colorama tags if any leaked through
