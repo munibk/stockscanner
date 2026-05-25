@@ -72,7 +72,7 @@ with st.sidebar:
     top_n = st.number_input("Show top N BUY signals (0 = all)", min_value=0, value=0, step=1)
 
     st.divider()
-    run = st.button("🔍 Run Scan", use_container_width=True, type="primary")
+    run = st.button("🔍 Run Scan", width="stretch", type="primary")
 
     st.divider()
     st.caption("ℹ️ For Zerodha Portfolio, run `python stockupdate.py --zerodha-login` once daily first.")
@@ -195,7 +195,7 @@ def _style_signal(val):
     return "background-color: #3b3b0d; color: #ffd600"
 
 styled_table = df_table.style.map(_style_signal, subset=["Signal"])
-st.dataframe(styled_table, use_container_width=True, hide_index=True)
+st.dataframe(styled_table, width="stretch", hide_index=True)
 
 st.divider()
 
@@ -330,7 +330,7 @@ for r in results:
             fig.update_yaxes(title_text="Volume", row=2, col=1, title_font_size=10)
             fig.update_yaxes(title_text="RSI",    row=3, col=1, range=[0, 100], title_font_size=10)
 
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.divider()

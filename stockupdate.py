@@ -28,6 +28,8 @@ import sys
 import webbrowser
 from datetime import date, datetime, timedelta
 
+import time
+
 import pandas as pd
 import requests
 import yfinance as yf
@@ -216,13 +218,30 @@ _PERIOD_DAYS = {
 # ── Data fetch ──────────────────────────────────────────────────────────────
 MIN_ROWS = 50   # minimum candles required for reliable indicator calculation
 
+def _yf_download(symbol: str, period: str, interval: str,
+                  retries: int = 3, backoff: float = 5.0) -> pd.DataFrame:
+    """Wrapper around yf.download with retry on rate-limit errors."""
+    for attempt in range(retries):
+        try:
+            df = yf.download(symbol, period=period, interval=interval,
+                             progress=False, auto_adjust=True)
+            return df
+        except Exception as exc:
+            if "rate" in str(exc).lower() or "429" in str(exc):
+                wait = backoff * (2 ** attempt)
+                time.sleep(wait)
+            else:
+                raise
+    return yf.download(symbol, period=period, interval=interval,
+                       progress=False, auto_adjust=True)
+
+
 def fetch_data(ticker: str, interval: str = "1d") -> pd.DataFrame | None:
     period = INTERVAL_PERIOD.get(interval, "1y")
     ns_rows = bo_rows = 0
     try:
         symbol = ticker + ".NS"
-        df = yf.download(symbol, period=period, interval=interval,
-                         progress=False, auto_adjust=True)
+        df = _yf_download(symbol, period, interval)
         if df is not None and not df.empty and len(df) >= MIN_ROWS:
             df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
             df.dropna(inplace=True)
@@ -231,8 +250,7 @@ def fetch_data(ticker: str, interval: str = "1d") -> pd.DataFrame | None:
 
         # Try BSE suffix
         symbol = ticker + ".BO"
-        df = yf.download(symbol, period=period, interval=interval,
-                         progress=False, auto_adjust=True)
+        df = _yf_download(symbol, period, interval)
         if df is not None and not df.empty and len(df) >= MIN_ROWS:
             df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
             df.dropna(inplace=True)
