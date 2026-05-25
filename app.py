@@ -73,11 +73,16 @@ with st.sidebar:
     st.title("📈 Stock Scanner")
     st.divider()
 
-    mode = st.radio(
-        "Stock List",
-        ["Nifty 50", "Custom Tickers", "Zerodha Portfolio"],
-        index=0,
-    )
+    _kite_available = True
+    try:
+        import kiteconnect  # noqa: F401
+    except ImportError:
+        _kite_available = False
+
+    _mode_options = ["Nifty 50", "Custom Tickers"] + (["Zerodha Portfolio"] if _kite_available else [])
+    mode = st.radio("Stock List", _mode_options, index=0)
+    if not _kite_available:
+        st.caption("ℹ️ Zerodha Portfolio unavailable — kiteconnect not installed.")
 
     custom_input = ""
     if mode == "Custom Tickers":
