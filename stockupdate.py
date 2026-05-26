@@ -443,17 +443,34 @@ def _fetch_kite_data(ticker: str, interval: str) -> pd.DataFrame | None:
         kite = KiteConnect(api_key=api_key)
         kite.set_access_token(access_token)
 
-        # Resolve instrument token — try NSE first, then BSE
+        # Resolve instrument token via instruments dump
+        # (ltp() requires a higher-tier Kite subscription; instruments() is always available)
         instrument_token = None
-        for exchange in ("NSE", "BSE"):
-            key = f"{exchange}:{base}"
-            try:
-                ltp_data = kite.ltp([key])
-                if ltp_data and key in ltp_data:
-                    instrument_token = ltp_data[key]["instrument_token"]
+        try:
+            instruments = kite.instruments()
+            base_upper = base.upper()
+            # Exact match first, then without -SM suffix
+            candidates = [base_upper, base_upper.replace("-SM", "")]
+            for inst in instruments:
+                sym = str(inst.get("tradingsymbol", "")).upper()
+                exch = str(inst.get("exchange", ""))
+                if sym in candidates and exch in ("NSE", "BSE") and inst.get("instrument_type") == "EQ":
+                    instrument_token = inst["instrument_token"]
                     break
-            except Exception:
-                continue
+        except Exception:
+            pass
+
+        # Fallback: try ltp() (works on higher-tier plans)
+        if instrument_token is None:
+            for exchange in ("NSE", "BSE"):
+                key = f"{exchange}:{base}"
+                try:
+                    ltp_data = kite.ltp([key])
+                    if ltp_data and key in ltp_data:
+                        instrument_token = ltp_data[key]["instrument_token"]
+                        break
+                except Exception:
+                    continue
 
         if instrument_token is None:
             return None
