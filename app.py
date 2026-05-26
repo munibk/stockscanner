@@ -227,7 +227,8 @@ status_text.empty()
 
 # ── Warnings / errors ────────────────────────────────────────────────────────
 for tkr, rows in newly_listed:
-    st.warning(f"⚠ {tkr}: newly listed — only {rows} candle(s) available, need {MIN_ROWS}+ for analysis")
+    hint = " — NSE SME/Emerge stock. Yahoo Finance has no history for these; use **Zerodha Portfolio** mode instead." if tkr.upper().endswith("-SM") else ""
+    st.warning(f"⚠ {tkr}: newly listed — only {rows} candle(s) available, need {MIN_ROWS}+ for analysis.{hint}")
 
 if errors:
     st.error(f"Could not fetch data for: {', '.join(errors)}")

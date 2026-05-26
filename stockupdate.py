@@ -250,26 +250,73 @@ def _yf_download(symbol: str, period: str, interval: str,
                        progress=False, auto_adjust=True)
 
 
+def _yf_download_range(symbol: str, start: str, interval: str) -> pd.DataFrame:
+    """Download using explicit start/end dates — works for stocks with limited period support."""
+    try:
+        df = yf.download(symbol, start=start, interval=interval,
+                         progress=False, auto_adjust=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 def fetch_data(ticker: str, interval: str = "1d") -> pd.DataFrame | None:
     period = INTERVAL_PERIOD.get(interval, "1y")
     ns_rows = bo_rows = 0
+
+    # Build candidate symbols: also try without -SM suffix for NSE SME stocks
+    candidates_ns = [ticker + ".NS"]
+    candidates_bo = [ticker + ".BO"]
+    if ticker.upper().endswith("-SM"):
+        base = ticker[:-3]
+        candidates_ns.append(base + ".NS")
+        candidates_bo.append(base + ".BO")
+
+    # Periods to try in order (skip 'max' — not supported for all symbols)
+    extra_periods = ["2y", "5y"] if interval in ("1d", "1wk") else []
+
+    def _try_symbols(symbols):
+        for sym in symbols:
+            for per in [period] + extra_periods:
+                df = _yf_download(sym, per, interval)
+                if df is not None and not df.empty and len(df) >= MIN_ROWS:
+                    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+                    df.dropna(inplace=True)
+                    return df
+            # Fallback: explicit start date (bypasses period restriction for new listings)
+            if interval in ("1d", "1wk"):
+                df = _yf_download_range(sym, "2024-01-01", interval)
+                if df is not None and not df.empty and len(df) >= MIN_ROWS:
+                    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+                    df.dropna(inplace=True)
+                    return df
+        # Return best partial result for row count reporting
+        best_df = None
+        for sym in symbols:
+            df = _yf_download(sym, period, interval)
+            if df is not None and not df.empty:
+                if best_df is None or len(df) > len(best_df):
+                    best_df = df
+        return best_df  # may be < MIN_ROWS
+
     try:
-        symbol = ticker + ".NS"
-        df = _yf_download(symbol, period, interval)
+        df = _try_symbols(candidates_ns)
         if df is not None and not df.empty and len(df) >= MIN_ROWS:
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-            df.dropna(inplace=True)
             return df
         ns_rows = 0 if (df is None or df.empty) else len(df)
 
-        # Try BSE suffix
-        symbol = ticker + ".BO"
-        df = _yf_download(symbol, period, interval)
+        df = _try_symbols(candidates_bo)
         if df is not None and not df.empty and len(df) >= MIN_ROWS:
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-            df.dropna(inplace=True)
             return df
         bo_rows = 0 if (df is None or df.empty) else len(df)
+
+        # NSE direct API fallback (for SME/Emerge stocks not on Yahoo Finance)
+        if interval == "1d":
+            nse_df = _fetch_nse_data(ticker)
+            if nse_df is not None and len(nse_df) >= MIN_ROWS:
+                return nse_df
+            if nse_df is not None and len(nse_df) > max(ns_rows, bo_rows):
+                ns_rows = len(nse_df)   # update so NewlyListedError carries correct count
 
         # Try Kite Connect as final fallback
         kite_df = _fetch_kite_data(ticker, interval)
@@ -282,6 +329,61 @@ def fetch_data(ticker: str, interval: str = "1d") -> pd.DataFrame | None:
         return None
     except _NewlyListedError:
         raise
+    except Exception:
+        return None
+
+
+def _fetch_nse_data(ticker: str) -> pd.DataFrame | None:
+    """Fetch daily OHLCV from NSE India historical API — fallback for SME/Emerge stocks."""
+    try:
+        from datetime import timedelta
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nseindia.com/",
+        }
+        session = requests.Session()
+        # Warm up session cookie (required by NSE)
+        session.get("https://www.nseindia.com", headers=headers, timeout=10)
+
+        sym = ticker.upper().replace("-SM", "")   # NSE API uses bare symbol
+        to_dt   = date.today()
+        from_dt = to_dt - timedelta(days=730)     # 2 years
+        url = (
+            f"https://www.nseindia.com/api/historical/cm/equity"
+            f'?symbol={sym}&series=["EQ"]'
+            f"&from={from_dt.strftime('%d-%m-%Y')}"
+            f"&to={to_dt.strftime('%d-%m-%Y')}"
+        )
+        resp = session.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        rows = resp.json().get("data", [])
+        if not rows:
+            return None
+
+        records = []
+        for r in rows:
+            try:
+                records.append({
+                    "Date":   pd.to_datetime(r["CH_TIMESTAMP"]),
+                    "Open":   float(r["CH_OPENING_PRICE"]),
+                    "High":   float(r["CH_TRADE_HIGH_PRICE"]),
+                    "Low":    float(r["CH_TRADE_LOW_PRICE"]),
+                    "Close":  float(r["CH_CLOSING_PRICE"]),
+                    "Volume": float(r["CH_TOT_TRADED_QTY"]),
+                })
+            except (KeyError, ValueError):
+                continue
+
+        if not records:
+            return None
+
+        df = pd.DataFrame(records).set_index("Date").sort_index()
+        df.dropna(inplace=True)
+        return df
     except Exception:
         return None
 
@@ -856,8 +958,11 @@ def scan(tickers: list[str], interval: str, top: int | None) -> None:
     print(" " * 50, end="\r")  # clear progress line
 
     for tkr, rows in newly_listed:
+        hint = ""
+        if tkr.upper().endswith("-SM"):
+            hint = " (NSE SME/Emerge stock — Yahoo Finance has no history. Login to Zerodha and retry.)"
         print(Fore.YELLOW + f"  ⚠  {tkr}: newly listed — only {rows} candle(s) available, "
-              f"need {MIN_ROWS}+ for analysis." + Style.RESET_ALL)
+              f"need {MIN_ROWS}+ for analysis.{hint}" + Style.RESET_ALL)
 
     if not results:
         if newly_listed and not errors:
