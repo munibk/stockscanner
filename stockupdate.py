@@ -334,58 +334,83 @@ def fetch_data(ticker: str, interval: str = "1d") -> pd.DataFrame | None:
 
 
 def _fetch_nse_data(ticker: str) -> pd.DataFrame | None:
-    """Fetch daily OHLCV from NSE India historical API — fallback for SME/Emerge stocks."""
-    try:
-        from datetime import timedelta
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.nseindia.com/",
-        }
-        session = requests.Session()
-        # Warm up session cookie (required by NSE)
-        session.get("https://www.nseindia.com", headers=headers, timeout=10)
+    """
+    Fetch daily OHLCV from NSE India bhavcopy archive files.
+    Works for both mainboard (series EQ) and SME/Emerge (series SM) stocks.
+    Downloads daily files in parallel — no Cloudflare issues (nsearchives subdomain).
+    """
+    import io
+    import zipfile
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        sym = ticker.upper().replace("-SM", "")   # NSE API uses bare symbol
-        to_dt   = date.today()
-        from_dt = to_dt - timedelta(days=730)     # 2 years
-        url = (
-            f"https://www.nseindia.com/api/historical/cm/equity"
-            f'?symbol={sym}&series=["EQ"]'
-            f"&from={from_dt.strftime('%d-%m-%Y')}"
-            f"&to={to_dt.strftime('%d-%m-%Y')}"
-        )
-        resp = session.get(url, headers=headers, timeout=15)
-        resp.raise_for_status()
-        rows = resp.json().get("data", [])
-        if not rows:
+    # Parse ticker: "PRANIK-SM" → base="PRANIK", series="SM"
+    #               "RELIANCE"  → base="RELIANCE", series="EQ"
+    if ticker.upper().endswith("-SM"):
+        base_sym = ticker[:-3].upper()
+        series   = "SM"
+    else:
+        base_sym = ticker.upper()
+        series   = "EQ"
+
+    bhav_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://www.nseindia.com/",
+    }
+
+    def _fetch_one_day(dt: date):
+        """Download bhavcopy for one date, return (date, row_dict) or None."""
+        ds  = dt.strftime("%Y%m%d")
+        url = (f"https://nsearchives.nseindia.com/content/cm/"
+               f"BhavCopy_NSE_CM_0_0_0_{ds}_F_0000.csv.zip")
+        try:
+            r = requests.get(url, headers=bhav_headers, timeout=15)
+            if r.status_code != 200:
+                return None
+            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                df = pd.read_csv(z.open(z.namelist()[0]), dtype=str)
+            row = df[
+                (df["TckrSymb"].str.strip().str.upper() == base_sym) &
+                (df["SctySrs"].str.strip().str.upper() == series)
+            ]
+            if row.empty:
+                return None
+            r0 = row.iloc[0]
+            return {
+                "Date":   pd.to_datetime(r0["TradDt"]),
+                "Open":   float(r0["OpnPric"]),
+                "High":   float(r0["HghPric"]),
+                "Low":    float(r0["LwPric"]),
+                "Close":  float(r0["ClsPric"]),
+                "Volume": float(r0["TtlTradgVol"]),
+            }
+        except Exception:
             return None
 
-        records = []
-        for r in rows:
-            try:
-                records.append({
-                    "Date":   pd.to_datetime(r["CH_TIMESTAMP"]),
-                    "Open":   float(r["CH_OPENING_PRICE"]),
-                    "High":   float(r["CH_TRADE_HIGH_PRICE"]),
-                    "Low":    float(r["CH_TRADE_LOW_PRICE"]),
-                    "Close":  float(r["CH_CLOSING_PRICE"]),
-                    "Volume": float(r["CH_TOT_TRADED_QTY"]),
-                })
-            except (KeyError, ValueError):
-                continue
+    # Generate candidate trading dates (skip weekends; holidays → 404 → skipped)
+    candidate_dates = []
+    dt = date.today()
+    cutoff = date.today() - timedelta(days=730)   # up to 2 years back
+    while dt >= cutoff:
+        if dt.weekday() < 5:
+            candidate_dates.append(dt)
+        dt -= timedelta(days=1)
 
-        if not records:
-            return None
+    records = []
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = {pool.submit(_fetch_one_day, d): d for d in candidate_dates}
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result:
+                records.append(result)
 
-        df = pd.DataFrame(records).set_index("Date").sort_index()
-        df.dropna(inplace=True)
-        return df
-    except Exception:
+    if not records:
         return None
+
+    df_out = pd.DataFrame(records).set_index("Date").sort_index()
+    df_out.dropna(inplace=True)
+    return df_out
 
 
 class _NewlyListedError(Exception):
