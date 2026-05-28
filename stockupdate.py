@@ -891,67 +891,115 @@ def _build_summary(signal, score, rsi, adx, vol_ratio, trend_strong,
                    proj_up_pct, proj_down_pct, proj_timeline,
                    nearest_res, nearest_sup, buy_reasons, sell_reasons) -> str:
     """Plain-English explanation of the signal for non-technical readers."""
-    parts = []
+    lines = []
 
-    # Trend
+    # Opening verdict
+    if signal == "BUY":
+        confidence = "strongly" if score >= 75 else "moderately"
+        lines.append(f"Our analysis {confidence} suggests this stock is worth buying right now.")
+    elif signal == "SELL":
+        confidence = "strongly" if score <= 25 else "moderately"
+        lines.append(f"Our analysis {confidence} suggests avoiding or exiting this stock right now.")
+    else:
+        lines.append("This stock is sending mixed signals — it's not a clear buy or sell at the moment.")
+
+    # Trend in plain words
     if trend_strong:
-        parts.append("The stock is in a strong trend")
+        if buy_reasons:
+            lines.append("The stock has been steadily climbing and is in a healthy upward trend.")
+        else:
+            lines.append("The stock has been steadily falling and is in a downward trend.")
     else:
-        parts.append("The stock is moving sideways without a clear trend")
+        lines.append("The stock has been moving without a strong direction lately.")
 
-    # RSI
+    # RSI — momentum in simple terms
     if rsi < 35:
-        parts.append(f"and is oversold (RSI {rsi:.0f}), meaning it may have fallen too far and could bounce back")
-    elif rsi > 65:
-        parts.append(f"and is overbought (RSI {rsi:.0f}), meaning it has risen sharply and may be due for a pullback")
+        lines.append(
+            f"It looks oversold (momentum score: {rsi:.0f}/100) — meaning it may have dropped "
+            f"more than it deserved and could bounce back soon."
+        )
+    elif rsi > 70:
+        lines.append(
+            f"It looks overbought (momentum score: {rsi:.0f}/100) — meaning it has risen a lot "
+            f"in a short time and might take a breather or pull back."
+        )
+    elif rsi > 60:
+        lines.append(f"Momentum is positive (score: {rsi:.0f}/100) — buyers are in control.")
+    elif rsi < 40:
+        lines.append(f"Momentum is weak (score: {rsi:.0f}/100) — sellers have the upper hand.")
     else:
-        parts.append(f"with neutral momentum (RSI {rsi:.0f})")
+        lines.append(f"Momentum is neutral (score: {rsi:.0f}/100) — neither buyers nor sellers dominate.")
 
-    # Volume
-    if vol_ratio > 1.5:
-        parts.append(f"Trading volume is unusually high ({vol_ratio:.1f}× average), confirming the move.")
+    # Volume — participation
+    if vol_ratio > 2.0:
+        lines.append(
+            f"Trading activity is very high today ({vol_ratio:.1f}× the usual) — "
+            f"this means a lot of people are buying/selling, which adds confidence to the signal."
+        )
+    elif vol_ratio > 1.4:
+        lines.append(
+            f"Trading activity is above average ({vol_ratio:.1f}× normal), "
+            f"which gives the signal more credibility."
+        )
     elif vol_ratio < 0.5:
-        parts.append("Volume is low, so the move may lack conviction.")
+        lines.append(
+            "Trading activity is very low today — take this signal with caution, "
+            "as few participants means the move may not hold."
+        )
 
-    # Key reasons in plain English
+    # Key reasons translated
     reason_map = {
-        "Price above EMA20 > EMA50 (uptrend)":        "Short-term averages are stacked bullishly.",
-        "Price below EMA20 < EMA50 (downtrend)":      "Short-term averages are stacked bearishly.",
-        "MACD bullish crossover":                      "Momentum has just turned upward (MACD crossover).",
-        "MACD bearish crossover":                      "Momentum has just turned downward (MACD crossover).",
-        "Price at lower Bollinger Band (oversold)":    "Price is at the lower edge of its normal range.",
-        "Price at upper Bollinger Band (overbought)":  "Price is at the upper edge of its normal range.",
+        "Price above EMA20 > EMA50 (uptrend)":       "The price is sitting above its 20-day and 50-day averages — a classic sign of an uptrend.",
+        "Price below EMA20 < EMA50 (downtrend)":     "The price has fallen below its 20-day and 50-day averages — a classic sign of a downtrend.",
+        "MACD bullish crossover":                     "A key momentum indicator just flipped from bearish to bullish — often an early buy signal.",
+        "MACD bearish crossover":                     "A key momentum indicator just flipped from bullish to bearish — often an early sell signal.",
+        "Price at lower Bollinger Band (oversold)":   "The price has dropped to the very bottom of its normal trading range — a potential bounce point.",
+        "Price at upper Bollinger Band (overbought)": "The price has risen to the very top of its normal trading range — a potential pullback point.",
+        "Near support":                               f"The price is sitting near a key support level (₹{nearest_sup:,.0f}) where buyers tend to step in." if nearest_sup else "",
+        "Near resistance":                            f"The price is approaching a key resistance level (₹{nearest_res:,.0f}) where sellers tend to push back." if nearest_res else "",
     }
     active_reasons = buy_reasons if signal in ("BUY", "HOLD") else sell_reasons
+    seen = set()
     for raw in active_reasons:
-        plain = next((v for k, v in reason_map.items() if k in raw), None)
-        if plain:
-            parts.append(plain)
+        for k, v in reason_map.items():
+            if k in raw and v and k not in seen:
+                seen.add(k)
+                lines.append(v)
+                break
 
-    # Target / stop
+    # Action guidance
     if signal == "BUY":
-        parts.append(
-            f"If the stock moves as expected, it could rise ~{proj_up_pct:.1f}% "
-            f"in {proj_timeline}. Risk on the downside is ~{abs(proj_down_pct):.1f}%."
+        lines.append(
+            f"If you buy now, the stock could potentially gain around {proj_up_pct:.1f}% "
+            f"over the next {proj_timeline}."
         )
-        if nearest_res:
-            parts.append(f"The nearest resistance (sell zone) is ₹{nearest_res:,.2f}.")
         if nearest_sup:
-            parts.append(f"A good stop-loss level would be around ₹{nearest_sup:,.2f}.")
+            lines.append(
+                f"To protect yourself, consider placing a stop-loss near ₹{nearest_sup:,.0f} — "
+                f"if the stock falls to that level, it would be wise to exit to limit losses ({abs(proj_down_pct):.1f}% below current price)."
+            )
+        if nearest_res:
+            lines.append(
+                f"Your first profit target is around ₹{nearest_res:,.0f} — "
+                f"consider booking partial profits there."
+            )
     elif signal == "SELL":
-        parts.append(
-            f"The stock could decline ~{abs(proj_down_pct):.1f}% from here. "
-            f"Upside risk if wrong is ~{proj_up_pct:.1f}%."
+        lines.append(
+            f"The stock could fall around {abs(proj_down_pct):.1f}% from here. "
+            f"If you hold it, you risk losses of that amount."
         )
         if nearest_res:
-            parts.append(f"Resistance above at ₹{nearest_res:,.2f} is likely to cap any bounce.")
+            lines.append(
+                f"If the stock bounces back up to ₹{nearest_res:,.0f}, that would be a resistance "
+                f"level — likely a good place to exit or sell."
+            )
     else:
-        parts.append(
-            "There are mixed signals — no clear edge in either direction right now. "
-            "It may be safer to wait for a clearer setup before taking a position."
+        lines.append(
+            "The best move right now is to wait and watch. "
+            "Let the stock pick a clear direction before putting money in."
         )
 
-    return " ".join(parts)
+    return " ".join(lines)
 
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
