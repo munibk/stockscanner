@@ -432,7 +432,7 @@ for r in results:
             _sk_col = "green" if _sk < 30 else ("red" if _sk > 70 else "orange")
             st.markdown(f"📊 **StochRSI:** K={_sk:.0f} &nbsp; D={_sd:.0f}")
             st.markdown(f"📌 **ATR%:** {_atr:.2f}% (expected daily move)")
-    if mode in ("Intraday Picks (top 30)", "All NSE Stocks", "All NSE + SME") and r.get("intraday_reasons"):
+            if mode in ("Intraday Picks (top 30)", "All NSE Stocks", "All NSE + SME") and r.get("intraday_reasons"):
                 st.markdown(f"🎯 **Intraday Score:** {r.get('intraday_pts', 0)} pts")
                 for _ir in r["intraday_reasons"]:
                     st.markdown(f"  - {_ir}")
