@@ -436,246 +436,281 @@ m4.metric("🔴 SELL", sells)
 
 st.divider()
 
-# ── Results table ─────────────────────────────────────────────────────────────
-st.subheader("Summary Table")
+# ── Price band grouping ───────────────────────────────────────────────────────
+_PRICE_BANDS = [
+    (0,      50,          "Under ₹50"),
+    (50,     100,         "₹50 – ₹100"),
+    (100,    200,         "₹100 – ₹200"),
+    (200,    500,         "₹200 – ₹500"),
+    (500,    1_000,       "₹500 – ₹1,000"),
+    (1_000,  2_000,       "₹1,000 – ₹2,000"),
+    (2_000,  5_000,       "₹2,000 – ₹5,000"),
+    (5_000,  float("inf"), "Above ₹5,000"),
+]
 
-table_rows = []
+def _price_band(price):
+    for lo, hi, label in _PRICE_BANDS:
+        if lo <= price < hi:
+            return label
+    return "Above ₹5,000"
+
+from collections import defaultdict as _dd
+_grouped = _dd(list)
 for r in results:
-    row = {
-        "Ticker":     r["ticker"],
-        "Price (₹)":  f"₹{r['price']:,.2f}",
-        "Signal":     r["signal"],
-        "Score":      r["score"],
-        "RSI":        r["rsi"],
-        "ADX":        r["adx"] if r["adx"] else None,
-        "Vol Ratio":  r["vol_ratio"],
-        "Target":     f"₹{r['proj_up']:,.2f}  ({r['proj_up_pct']:+.1f}%)",
-        "Stop":       f"₹{r['proj_down']:,.2f}  ({r['proj_down_pct']:+.1f}%)",
-        "Timeline":   r["proj_timeline"],
-    }
-    if mode in ("Intraday Picks (top 30)", "All NSE Stocks", "All NSE + SME"):
-        row["Intraday★"] = r.get("intraday_pts", 0)
-        row["ATR%"]      = f"{r.get('atr_pct', 0):.1f}%"
-        _vp = r.get("vwap_pct")
-        row["vs VWAP"]   = f"{_vp:+.1f}%" if _vp is not None else "—"
-    table_rows.append(row)
+    _grouped[_price_band(r["price"])].append(r)
 
-df_table = pd.DataFrame(table_rows)
+# ── Display results grouped by price band ─────────────────────────────────────
+for _lo, _hi, _band_lbl in _PRICE_BANDS:
+    _band_rs = _grouped.get(_band_lbl, [])
+    if not _band_rs:
+        continue
 
-styled_table = df_table.style.map(_style_signal, subset=["Signal"])
-st.dataframe(styled_table, use_container_width=True, hide_index=True)
+    _bb = sum(1 for r in _band_rs if r["signal"] == "BUY")
+    _bh = sum(1 for r in _band_rs if r["signal"] == "HOLD")
+    _bs = sum(1 for r in _band_rs if r["signal"] == "SELL")
+    st.markdown(
+        f"### {_band_lbl} &nbsp;"
+        f"<small style='color:#888'>({len(_band_rs)} stocks &nbsp;|&nbsp; "
+        f"🟢 {_bb} BUY &nbsp; 🟡 {_bh} HOLD &nbsp; 🔴 {_bs} SELL)</small>",
+        unsafe_allow_html=True,
+    )
 
-st.divider()
+    # Summary table for this band
+    _trows = []
+    for r in _band_rs:
+        _row = {
+            "Ticker":    r["ticker"],
+            "Price (₹)": f"₹{r['price']:,.2f}",
+            "Signal":    r["signal"],
+            "Score":     r["score"],
+            "RSI":       r["rsi"],
+            "ADX":       r["adx"] if r["adx"] else None,
+            "Vol Ratio": r["vol_ratio"],
+            "Target":    f"₹{r['proj_up']:,.2f}  ({r['proj_up_pct']:+.1f}%)",
+            "Stop":      f"₹{r['proj_down']:,.2f}  ({r['proj_down_pct']:+.1f}%)",
+            "Timeline":  r["proj_timeline"],
+        }
+        if mode in ("Intraday Picks (top 30)", "All NSE Stocks", "All NSE + SME"):
+            _row["Intraday★"] = r.get("intraday_pts", 0)
+            _row["ATR%"]      = f"{r.get('atr_pct', 0):.1f}%"
+            _vp = r.get("vwap_pct")
+            _row["vs VWAP"]   = f"{_vp:+.1f}%" if _vp is not None else "—"
+        _trows.append(_row)
 
-# ── Per-stock detail + chart ──────────────────────────────────────────────────
-st.subheader("📊 Stock Details & Charts")
+    st.dataframe(
+        pd.DataFrame(_trows).style.map(_style_signal, subset=["Signal"]),
+        use_container_width=True, hide_index=True,
+    )
 
-for r in results:
-    sig_icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}[r["signal"]]
-    label    = f"{sig_icon}  **{r['ticker']}**  —  {r['signal']}  ({r['score']:.0f}/100)  ₹{r['price']:,.2f}"
+    # Per-stock detail + chart for this band
+    for r in _band_rs:
+        sig_icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}[r["signal"]]
+        label    = f"{sig_icon}  **{r['ticker']}**  —  {r['signal']}  ({r['score']:.0f}/100)  ₹{r['price']:,.2f}"
 
-    with st.expander(label, expanded=(len(results) == 1)):
-        info_col, chart_col = st.columns([1, 3])
+        with st.expander(label, expanded=(len(results) == 1)):
+            info_col, chart_col = st.columns([1, 3])
 
-        # ── Info panel (shown first so it stacks on top on mobile) ──
-        with info_col:
-            st.markdown(f"### {r['ticker']}")
-            sig_color = {"BUY": "green", "SELL": "red", "HOLD": "orange"}[r["signal"]]
-            st.markdown(f"**Signal:** :{sig_color}[{r['signal']}] &nbsp; Score: **{r['score']:.0f}/100**")
-            st.markdown(f"**RSI:** {r['rsi']}  |  **ADX:** {r['adx'] or '\u2014'}  |  **Vol:** {r['vol_ratio']}x")
-            st.markdown("---")
-            st.markdown(f"🎯 **Target:** ₹{r['proj_up']:,.2f}  ({r['proj_up_pct']:+.1f}%)  *{r['proj_timeline']}*")
-            st.markdown(f"🛑 **Stop:**   ₹{r['proj_down']:,.2f}  ({r['proj_down_pct']:+.1f}%)")
-            if r["resistances"]:
-                st.markdown("🔴 **Resistance:** " + " | ".join(f"₹{v:,.2f}" for v in r["resistances"]))
-            if r["supports"]:
-                st.markdown("🟢 **Support:**    " + " | ".join(f"₹{v:,.2f}" for v in r["supports"]))
-            st.markdown("---")
-            if r.get("summary"):
-                icon = "🟢" if r["signal"] == "BUY" else ("🔴" if r["signal"] == "SELL" else "🟡")
-                st.info(f"{icon} **In plain English:** {r['summary']}")
+            # ── Info panel (shown first so it stacks on top on mobile) ──
+            with info_col:
+                st.markdown(f"### {r['ticker']}")
+                sig_color = {"BUY": "green", "SELL": "red", "HOLD": "orange"}[r["signal"]]
+                st.markdown(f"**Signal:** :{sig_color}[{r['signal']}] &nbsp; Score: **{r['score']:.0f}/100**")
+                st.markdown(f"**RSI:** {r['rsi']}  |  **ADX:** {r['adx'] or '\u2014'}  |  **Vol:** {r['vol_ratio']}x")
                 st.markdown("---")
-            st.markdown("**Reasons:**")
-            for reason in r["reasons"]:
-                # strip colorama tags if any leaked through
-                clean = reason.replace("⚠ Against: ", "⚠️ *Against:* ")
-                st.markdown(f"- {clean}")
+                st.markdown(f"🎯 **Target:** ₹{r['proj_up']:,.2f}  ({r['proj_up_pct']:+.1f}%)  *{r['proj_timeline']}*")
+                st.markdown(f"🛑 **Stop:**   ₹{r['proj_down']:,.2f}  ({r['proj_down_pct']:+.1f}%)")
+                if r["resistances"]:
+                    st.markdown("🔴 **Resistance:** " + " | ".join(f"₹{v:,.2f}" for v in r["resistances"]))
+                if r["supports"]:
+                    st.markdown("🟢 **Support:**    " + " | ".join(f"₹{v:,.2f}" for v in r["supports"]))
+                st.markdown("---")
+                if r.get("summary"):
+                    icon = "🟢" if r["signal"] == "BUY" else ("🔴" if r["signal"] == "SELL" else "🟡")
+                    st.info(f"{icon} **In plain English:** {r['summary']}")
+                    st.markdown("---")
+                st.markdown("**Reasons:**")
+                for reason in r["reasons"]:
+                    # strip colorama tags if any leaked through
+                    clean = reason.replace("⚠ Against: ", "⚠️ *Against:* ")
+                    st.markdown(f"- {clean}")
 
-            # ── Intraday & technical indicators ──────────────────────────────
-            st.markdown("---")
-            st.markdown("**Technical Indicators:**")
-            _vwap_val = r.get("vwap")
-            _vwap_pct = r.get("vwap_pct")
-            _sk       = r.get("stoch_k", 50)
-            _sd       = r.get("stoch_d", 50)
-            _atr      = r.get("atr_pct", 0)
-            if _vwap_val:
-                _vc = "green" if (_vwap_pct or 0) >= 0 else "red"
-                st.markdown(f"🟡 **VWAP:** ₹{_vwap_val:,.2f} &nbsp; :{_vc}[{_vwap_pct:+.2f}%]")
-            _sk_col = "green" if _sk < 30 else ("red" if _sk > 70 else "orange")
-            st.markdown(f"📊 **StochRSI:** K={_sk:.0f} &nbsp; D={_sd:.0f}")
-            st.markdown(f"📌 **ATR%:** {_atr:.2f}% (expected daily move)")
-            if mode in ("Intraday Picks (top 30)", "All NSE Stocks", "All NSE + SME") and r.get("intraday_reasons"):
-                st.markdown(f"🎯 **Intraday Score:** {r.get('intraday_pts', 0)} pts")
-                for _ir in r["intraday_reasons"]:
-                    st.markdown(f"  - {_ir}")
+                # ── Intraday & technical indicators ──────────────────────────
+                st.markdown("---")
+                st.markdown("**Technical Indicators:**")
+                _vwap_val = r.get("vwap")
+                _vwap_pct = r.get("vwap_pct")
+                _sk       = r.get("stoch_k", 50)
+                _sd       = r.get("stoch_d", 50)
+                _atr      = r.get("atr_pct", 0)
+                if _vwap_val:
+                    _vc = "green" if (_vwap_pct or 0) >= 0 else "red"
+                    st.markdown(f"🟡 **VWAP:** ₹{_vwap_val:,.2f} &nbsp; :{_vc}[{_vwap_pct:+.2f}%]")
+                _sk_col = "green" if _sk < 30 else ("red" if _sk > 70 else "orange")
+                st.markdown(f"📊 **StochRSI:** K={_sk:.0f} &nbsp; D={_sd:.0f}")
+                st.markdown(f"📌 **ATR%:** {_atr:.2f}% (expected daily move)")
+                if mode in ("Intraday Picks (top 30)", "All NSE Stocks", "All NSE + SME") and r.get("intraday_reasons"):
+                    st.markdown(f"🎯 **Intraday Score:** {r.get('intraday_pts', 0)} pts")
+                    for _ir in r["intraday_reasons"]:
+                        st.markdown(f"  - {_ir}")
 
-            # ── Buy / Sell signal badge ───────────────────────────────────────
-            st.markdown("---")
-            _badge_css = {
-                "BUY":  "background:#0d3b26;color:#00e676;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
-                "SELL": "background:#3b0d0d;color:#ff5252;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
-                "HOLD": "background:#3b3b0d;color:#ffd600;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
-            }[r["signal"]]
-            st.markdown(f'<span style="{_badge_css}">{r["signal"]} &nbsp; {r["score"]:.0f}/100</span>', unsafe_allow_html=True)
+                # ── Buy / Sell signal badge ───────────────────────────────────
+                st.markdown("---")
+                _badge_css = {
+                    "BUY":  "background:#0d3b26;color:#00e676;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
+                    "SELL": "background:#3b0d0d;color:#ff5252;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
+                    "HOLD": "background:#3b3b0d;color:#ffd600;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
+                }[r["signal"]]
+                st.markdown(f'<span style="{_badge_css}">{r["signal"]} &nbsp; {r["score"]:.0f}/100</span>', unsafe_allow_html=True)
 
-        # ── Candlestick chart (4 panels: Price, Volume, RSI, MACD) ──
-        with chart_col:
-            df_c = r["_df"].tail(150).copy()
+            # ── Candlestick chart (4 panels: Price, Volume, RSI, MACD) ──
+            with chart_col:
+                df_c = r["_df"].tail(150).copy()
 
-            fig = make_subplots(
-                rows=4, cols=1,
-                shared_xaxes=True,
-                row_heights=[0.50, 0.17, 0.16, 0.17],
-                vertical_spacing=0.02,
-                subplot_titles=("", "Volume", "RSI (14)", "MACD (12/26/9)"),
-            )
+                fig = make_subplots(
+                    rows=4, cols=1,
+                    shared_xaxes=True,
+                    row_heights=[0.50, 0.17, 0.16, 0.17],
+                    vertical_spacing=0.02,
+                    subplot_titles=("", "Volume", "RSI (14)", "MACD (12/26/9)"),
+                )
 
-            # Candlestick
-            fig.add_trace(go.Candlestick(
-                x=df_c.index,
-                open=df_c["Open"], high=df_c["High"],
-                low=df_c["Low"],  close=df_c["Close"],
-                name="Price",
-                increasing_line_color="#26a69a",
-                decreasing_line_color="#ef5350",
-                showlegend=False,
-            ), row=1, col=1)
-
-            # EMAs
-            fig.add_trace(go.Scatter(
-                x=df_c.index, y=df_c["EMA20"],
-                line=dict(color="#2196f3", width=1.2), name="EMA 20",
-            ), row=1, col=1)
-            fig.add_trace(go.Scatter(
-                x=df_c.index, y=df_c["EMA50"],
-                line=dict(color="#ff9800", width=1.2), name="EMA 50",
-            ), row=1, col=1)
-            if "SMA200" in df_c.columns:
-                fig.add_trace(go.Scatter(
-                    x=df_c.index, y=df_c["SMA200"],
-                    line=dict(color="#ce93d8", width=1, dash="dot"), name="SMA 200",
-                ), row=1, col=1)
-
-            # VWAP
-            if "VWAP" in df_c.columns:
-                fig.add_trace(go.Scatter(
-                    x=df_c.index, y=df_c["VWAP"],
-                    line=dict(color="#ffeb3b", width=1.5, dash="dash"), name="VWAP",
-                ), row=1, col=1)
-
-            # Bollinger Bands
-            fig.add_trace(go.Scatter(
-                x=df_c.index, y=df_c["BB_up"],
-                line=dict(color="rgba(100,100,255,0.4)", width=1, dash="dot"),
-                name="BB Upper", showlegend=False,
-            ), row=1, col=1)
-            fig.add_trace(go.Scatter(
-                x=df_c.index, y=df_c["BB_low"],
-                line=dict(color="rgba(100,100,255,0.4)", width=1, dash="dot"),
-                name="BB Lower",
-                fill="tonexty", fillcolor="rgba(100,100,255,0.05)",
-                showlegend=False,
-            ), row=1, col=1)
-
-            # S/R horizontal lines
-            for res in r["resistances"]:
-                fig.add_hline(y=res, line_dash="dash", line_color="rgba(239,83,80,0.6)",
-                              line_width=1, row=1, col=1)
-            for sup in r["supports"]:
-                fig.add_hline(y=sup, line_dash="dash", line_color="rgba(38,166,154,0.6)",
-                              line_width=1, row=1, col=1)
-
-            # Target / stop annotations
-            fig.add_hline(y=r["proj_up"],   line_dash="dot", line_color="rgba(0,230,118,0.8)",
-                          line_width=1.5, row=1, col=1,
-                          annotation_text=f"🎯 ₹{r['proj_up']:,.0f}",
-                          annotation_position="top right")
-            fig.add_hline(y=r["proj_down"], line_dash="dot", line_color="rgba(255,82,82,0.8)",
-                          line_width=1.5, row=1, col=1,
-                          annotation_text=f"🛑 ₹{r['proj_down']:,.0f}",
-                          annotation_position="bottom right")
-
-            # Volume bars (green/red)
-            vol_colors = [
-                "#ef5350" if c < o else "#26a69a"
-                for c, o in zip(df_c["Close"], df_c["Open"])
-            ]
-            fig.add_trace(go.Bar(
-                x=df_c.index, y=df_c["Volume"],
-                marker_color=vol_colors, name="Volume", showlegend=False,
-            ), row=2, col=1)
-            # Volume average line
-            if "Vol_avg" in df_c.columns:
-                fig.add_trace(go.Scatter(
-                    x=df_c.index, y=df_c["Vol_avg"],
-                    line=dict(color="rgba(255,235,59,0.7)", width=1, dash="dot"),
-                    name="Vol Avg", showlegend=False,
-                ), row=2, col=1)
-
-            # RSI
-            fig.add_trace(go.Scatter(
-                x=df_c.index, y=df_c["RSI"],
-                line=dict(color="#e91e63", width=1.5), name="RSI",
-            ), row=3, col=1)
-            if "RSI_smooth" in df_c.columns:
-                fig.add_trace(go.Scatter(
-                    x=df_c.index, y=df_c["RSI_smooth"],
-                    line=dict(color="rgba(233,30,99,0.4)", width=1), name="RSI Smooth",
+                # Candlestick
+                fig.add_trace(go.Candlestick(
+                    x=df_c.index,
+                    open=df_c["Open"], high=df_c["High"],
+                    low=df_c["Low"],  close=df_c["Close"],
+                    name="Price",
+                    increasing_line_color="#26a69a",
+                    decreasing_line_color="#ef5350",
                     showlegend=False,
+                ), row=1, col=1)
+
+                # EMAs
+                fig.add_trace(go.Scatter(
+                    x=df_c.index, y=df_c["EMA20"],
+                    line=dict(color="#2196f3", width=1.2), name="EMA 20",
+                ), row=1, col=1)
+                fig.add_trace(go.Scatter(
+                    x=df_c.index, y=df_c["EMA50"],
+                    line=dict(color="#ff9800", width=1.2), name="EMA 50",
+                ), row=1, col=1)
+                if "SMA200" in df_c.columns:
+                    fig.add_trace(go.Scatter(
+                        x=df_c.index, y=df_c["SMA200"],
+                        line=dict(color="#ce93d8", width=1, dash="dot"), name="SMA 200",
+                    ), row=1, col=1)
+
+                # VWAP
+                if "VWAP" in df_c.columns:
+                    fig.add_trace(go.Scatter(
+                        x=df_c.index, y=df_c["VWAP"],
+                        line=dict(color="#ffeb3b", width=1.5, dash="dash"), name="VWAP",
+                    ), row=1, col=1)
+
+                # Bollinger Bands
+                fig.add_trace(go.Scatter(
+                    x=df_c.index, y=df_c["BB_up"],
+                    line=dict(color="rgba(100,100,255,0.4)", width=1, dash="dot"),
+                    name="BB Upper", showlegend=False,
+                ), row=1, col=1)
+                fig.add_trace(go.Scatter(
+                    x=df_c.index, y=df_c["BB_low"],
+                    line=dict(color="rgba(100,100,255,0.4)", width=1, dash="dot"),
+                    name="BB Lower",
+                    fill="tonexty", fillcolor="rgba(100,100,255,0.05)",
+                    showlegend=False,
+                ), row=1, col=1)
+
+                # S/R horizontal lines
+                for res in r["resistances"]:
+                    fig.add_hline(y=res, line_dash="dash", line_color="rgba(239,83,80,0.6)",
+                                  line_width=1, row=1, col=1)
+                for sup in r["supports"]:
+                    fig.add_hline(y=sup, line_dash="dash", line_color="rgba(38,166,154,0.6)",
+                                  line_width=1, row=1, col=1)
+
+                # Target / stop annotations
+                fig.add_hline(y=r["proj_up"],   line_dash="dot", line_color="rgba(0,230,118,0.8)",
+                              line_width=1.5, row=1, col=1,
+                              annotation_text=f"🎯 ₹{r['proj_up']:,.0f}",
+                              annotation_position="top right")
+                fig.add_hline(y=r["proj_down"], line_dash="dot", line_color="rgba(255,82,82,0.8)",
+                              line_width=1.5, row=1, col=1,
+                              annotation_text=f"🛑 ₹{r['proj_down']:,.0f}",
+                              annotation_position="bottom right")
+
+                # Volume bars (green/red)
+                vol_colors = [
+                    "#ef5350" if c < o else "#26a69a"
+                    for c, o in zip(df_c["Close"], df_c["Open"])
+                ]
+                fig.add_trace(go.Bar(
+                    x=df_c.index, y=df_c["Volume"],
+                    marker_color=vol_colors, name="Volume", showlegend=False,
+                ), row=2, col=1)
+                # Volume average line
+                if "Vol_avg" in df_c.columns:
+                    fig.add_trace(go.Scatter(
+                        x=df_c.index, y=df_c["Vol_avg"],
+                        line=dict(color="rgba(255,235,59,0.7)", width=1, dash="dot"),
+                        name="Vol Avg", showlegend=False,
+                    ), row=2, col=1)
+
+                # RSI
+                fig.add_trace(go.Scatter(
+                    x=df_c.index, y=df_c["RSI"],
+                    line=dict(color="#e91e63", width=1.5), name="RSI",
                 ), row=3, col=1)
-            fig.add_hline(y=70, line_dash="dot", line_color="rgba(239,83,80,0.6)",  row=3, col=1,
-                          annotation_text="70", annotation_position="right")
-            fig.add_hline(y=30, line_dash="dot", line_color="rgba(38,166,154,0.6)", row=3, col=1,
-                          annotation_text="30", annotation_position="right")
-            fig.add_hrect(y0=30, y1=70, fillcolor="rgba(255,255,255,0.02)",
-                          line_width=0, row=3, col=1)
+                if "RSI_smooth" in df_c.columns:
+                    fig.add_trace(go.Scatter(
+                        x=df_c.index, y=df_c["RSI_smooth"],
+                        line=dict(color="rgba(233,30,99,0.4)", width=1), name="RSI Smooth",
+                        showlegend=False,
+                    ), row=3, col=1)
+                fig.add_hline(y=70, line_dash="dot", line_color="rgba(239,83,80,0.6)",  row=3, col=1,
+                              annotation_text="70", annotation_position="right")
+                fig.add_hline(y=30, line_dash="dot", line_color="rgba(38,166,154,0.6)", row=3, col=1,
+                              annotation_text="30", annotation_position="right")
+                fig.add_hrect(y0=30, y1=70, fillcolor="rgba(255,255,255,0.02)",
+                              line_width=0, row=3, col=1)
 
-            # MACD histogram + lines
-            macd_colors = [
-                "#26a69a" if v >= 0 else "#ef5350"
-                for v in df_c["MACD_hist"].fillna(0)
-            ]
-            fig.add_trace(go.Bar(
-                x=df_c.index, y=df_c["MACD_hist"],
-                marker_color=macd_colors, name="MACD Hist", showlegend=False,
-            ), row=4, col=1)
-            fig.add_trace(go.Scatter(
-                x=df_c.index, y=df_c["MACD"],
-                line=dict(color="#2196f3", width=1.5), name="MACD",
-            ), row=4, col=1)
-            fig.add_trace(go.Scatter(
-                x=df_c.index, y=df_c["MACD_sig"],
-                line=dict(color="#ff9800", width=1.5), name="Signal",
-            ), row=4, col=1)
-            fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.25)", row=4, col=1)
+                # MACD histogram + lines
+                macd_colors = [
+                    "#26a69a" if v >= 0 else "#ef5350"
+                    for v in df_c["MACD_hist"].fillna(0)
+                ]
+                fig.add_trace(go.Bar(
+                    x=df_c.index, y=df_c["MACD_hist"],
+                    marker_color=macd_colors, name="MACD Hist", showlegend=False,
+                ), row=4, col=1)
+                fig.add_trace(go.Scatter(
+                    x=df_c.index, y=df_c["MACD"],
+                    line=dict(color="#2196f3", width=1.5), name="MACD",
+                ), row=4, col=1)
+                fig.add_trace(go.Scatter(
+                    x=df_c.index, y=df_c["MACD_sig"],
+                    line=dict(color="#ff9800", width=1.5), name="Signal",
+                ), row=4, col=1)
+                fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.25)", row=4, col=1)
 
-            fig.update_layout(
-                height=600,
-                template="plotly_dark",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                margin=dict(l=0, r=70, t=20, b=0),
-                xaxis_rangeslider_visible=False,
-                legend=dict(orientation="h", y=1.06, x=0, font_size=11),
-            )
-            fig.update_yaxes(title_text="Volume", row=2, col=1, title_font_size=10)
-            fig.update_yaxes(title_text="RSI",    row=3, col=1, range=[0, 100], title_font_size=10)
-            fig.update_yaxes(title_text="MACD",   row=4, col=1, title_font_size=10)
-            fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
-            fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
+                fig.update_layout(
+                    height=600,
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=0, r=70, t=20, b=0),
+                    xaxis_rangeslider_visible=False,
+                    legend=dict(orientation="h", y=1.06, x=0, font_size=11),
+                )
+                fig.update_yaxes(title_text="Volume", row=2, col=1, title_font_size=10)
+                fig.update_yaxes(title_text="RSI",    row=3, col=1, range=[0, 100], title_font_size=10)
+                fig.update_yaxes(title_text="MACD",   row=4, col=1, title_font_size=10)
+                fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
+                fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
 
-            st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.divider()
