@@ -8,6 +8,7 @@ Then open http://localhost:8501 in your browser.
 
 import sys
 import os
+from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -17,11 +18,15 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from stockupdate import (
     fetch_nifty50_tickers,
+    fetch_all_nse_tickers,
     fetch_data,
     compute_indicators,
     generate_signal,
     fetch_zerodha_holdings,
     fetch_zerodha_holdings_with_token,
+    get_nifty_index_data,
+    intraday_setup_score,
+    NIFTY_INTRADAY_STOCKS,
     _NewlyListedError,
     MIN_ROWS,
 )
@@ -80,7 +85,13 @@ with st.sidebar:
     except ImportError:
         _kite_available = False
 
-    _mode_options = ["Nifty 50", "Custom Tickers"] + (["Zerodha Portfolio"] if _kite_available else [])
+    _mode_options = [
+        "Nifty 50",
+        "Intraday Picks (top 30)",
+        "All NSE Stocks",
+        "All NSE + SME",
+        "Custom Tickers",
+    ] + (["Zerodha Portfolio"] if _kite_available else [])
     mode = st.radio("Stock List", _mode_options, index=0)
 
     # ── Zerodha: show login link + request_token input ──
@@ -153,11 +164,22 @@ with st.sidebar:
     top_n = st.number_input("Show top N BUY signals (0 = all)", min_value=0, value=0, step=1)
 
     st.divider()
+    live_monitor = st.toggle("📗 Live Monitor (auto-refresh)", value=False)
+    refresh_secs = 60
+    if live_monitor:
+        refresh_secs = st.slider("Refresh every (seconds)", 30, 300, 60, 30)
+
+    st.divider()
     run = st.button("🔍 Run Scan", width="stretch", type="primary")
+    if run and live_monitor:
+        st.session_state["live_active"] = True
+    elif not live_monitor:
+        st.session_state.pop("live_active", None)
 
     st.divider()
     st.caption("ℹ️ Zerodha Portfolio: add api_key & api_secret to Streamlit Secrets, then log in from the sidebar.")
-
+# ── Auto-run when live monitor is active ────────────────────────────────────────
+run = run or (live_monitor and st.session_state.get("live_active", False))
 # ── Welcome screen ────────────────────────────────────────────────────────────
 if not run:
     st.title("📈 Nifty Stock Signal Scanner")
@@ -173,6 +195,19 @@ if not run:
 if mode == "Nifty 50":
     with st.spinner("Fetching Nifty 50 constituents from NSE..."):
         tickers = fetch_nifty50_tickers()
+
+elif mode == "Intraday Picks (top 30)":
+    tickers = list(NIFTY_INTRADAY_STOCKS)
+
+elif mode == "All NSE Stocks":
+    with st.spinner("Downloading NSE bhavcopy to get all listed stocks..."):
+        tickers = fetch_all_nse_tickers(include_sme=False)
+    st.info(f"📂 {len(tickers)} NSE mainboard stocks loaded. Large scan — may take several minutes.")
+
+elif mode == "All NSE + SME":
+    with st.spinner("Downloading NSE bhavcopy (mainboard + SME/Emerge)..."):
+        tickers = fetch_all_nse_tickers(include_sme=True)
+    st.info(f"📂 {len(tickers)} stocks loaded (mainboard + SME). Very large scan — may take 10–20+ minutes.")
 
 elif mode == "Custom Tickers":
     raw     = custom_input.replace(",", " ").replace("\n", " ").split()
@@ -243,7 +278,59 @@ results.sort(key=lambda x: (order[x["signal"]], -x["score"]))
 
 if top_n > 0:
     results = [r for r in results if r["signal"] == "BUY"][:int(top_n)]
+# ── Nifty 50 Index live widget ───────────────────────────────────────────────────
+with st.spinner("Loading Nifty 50 index data..."):
+    _nifty_df = get_nifty_index_data(interval)
 
+if _nifty_df is not None and len(_nifty_df) >= 2:
+    _nl  = float(_nifty_df["Close"].iloc[-1])
+    _np  = float(_nifty_df["Close"].iloc[-2])
+    _nc  = _nl - _np
+    _ncp = _nc / _np * 100
+    _nh  = float(_nifty_df["High"].iloc[-1])
+    _nlo = float(_nifty_df["Low"].iloc[-1])
+    st.markdown("### 📊 Nifty 50 Index")
+    _ni1, _ni2, _ni3, _ni4 = st.columns(4)
+    _ni1.metric("Nifty 50",  f"{_nl:,.2f}",  f"{_nc:+.2f} ({_ncp:+.2f}%)")
+    _ni2.metric("Day High",   f"{_nh:,.2f}")
+    _ni3.metric("Day Low",    f"{_nlo:,.2f}")
+    _ni4.metric("Market",     "🟢 Up" if _nc >= 0 else "🔴 Down")
+    with st.expander("📈 Nifty 50 Chart (last 60 candles)", expanded=False):
+        _nt = _nifty_df.tail(60)
+        _nf = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                            row_heights=[0.75, 0.25], vertical_spacing=0.02)
+        _nf.add_trace(go.Candlestick(
+            x=_nt.index, open=_nt["Open"], high=_nt["High"],
+            low=_nt["Low"], close=_nt["Close"], name="Nifty 50",
+            increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        ), row=1, col=1)
+        _nf.add_trace(go.Scatter(
+            x=_nt.index, y=_nt["Close"].ewm(span=20).mean(),
+            line=dict(color="#2196f3", width=1.5), name="EMA 20",
+        ), row=1, col=1)
+        _nf.add_trace(go.Scatter(
+            x=_nt.index, y=_nt["Close"].ewm(span=50).mean(),
+            line=dict(color="#ff9800", width=1.5), name="EMA 50",
+        ), row=1, col=1)
+        _vol_c = ["#ef5350" if c < o else "#26a69a"
+                  for c, o in zip(_nt["Close"], _nt["Open"])]
+        _nf.add_trace(go.Bar(
+            x=_nt.index, y=_nt["Volume"], marker_color=_vol_c,
+            name="Volume", showlegend=False,
+        ), row=2, col=1)
+        _nf.update_layout(
+            height=360, template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(l=0, r=0, t=10, b=0),
+            xaxis_rangeslider_visible=False,
+            legend=dict(orientation="h", y=1.08),
+        )
+        st.plotly_chart(_nf, use_container_width=True)
+    st.divider()
+
+# ── Apply intraday rank if in Intraday Picks mode ──────────────────────────────
+if mode in ("Intraday Picks (top 30)", "All NSE Stocks", "All NSE + SME"):
+    results = intraday_setup_score(results)
 # ── Summary metrics ───────────────────────────────────────────────────────────
 st.title("📈 Scan Results")
 
@@ -264,7 +351,7 @@ st.subheader("Summary Table")
 
 table_rows = []
 for r in results:
-    table_rows.append({
+    row = {
         "Ticker":     r["ticker"],
         "Price (₹)":  f"₹{r['price']:,.2f}",
         "Signal":     r["signal"],
@@ -275,7 +362,13 @@ for r in results:
         "Target":     f"₹{r['proj_up']:,.2f}  ({r['proj_up_pct']:+.1f}%)",
         "Stop":       f"₹{r['proj_down']:,.2f}  ({r['proj_down_pct']:+.1f}%)",
         "Timeline":   r["proj_timeline"],
-    })
+    }
+    if mode in ("Intraday Picks (top 30)", "All NSE Stocks", "All NSE + SME"):
+        row["Intraday★"] = r.get("intraday_pts", 0)
+        row["ATR%"]      = f"{r.get('atr_pct', 0):.1f}%"
+        _vp = r.get("vwap_pct")
+        row["vs VWAP"]   = f"{_vp:+.1f}%" if _vp is not None else "—"
+    table_rows.append(row)
 
 df_table = pd.DataFrame(table_rows)
 
@@ -287,7 +380,7 @@ def _style_signal(val):
     return "background-color: #3b3b0d; color: #ffd600"
 
 styled_table = df_table.style.map(_style_signal, subset=["Signal"])
-st.dataframe(styled_table, width="stretch", hide_index=True)
+st.dataframe(styled_table, use_container_width=True, hide_index=True)
 
 st.divider()
 
@@ -325,15 +418,44 @@ for r in results:
                 clean = reason.replace("⚠ Against: ", "⚠️ *Against:* ")
                 st.markdown(f"- {clean}")
 
-        # ── Candlestick chart ──
+            # ── Intraday & technical indicators ──────────────────────────────
+            st.markdown("---")
+            st.markdown("**Technical Indicators:**")
+            _vwap_val = r.get("vwap")
+            _vwap_pct = r.get("vwap_pct")
+            _sk       = r.get("stoch_k", 50)
+            _sd       = r.get("stoch_d", 50)
+            _atr      = r.get("atr_pct", 0)
+            if _vwap_val:
+                _vc = "green" if (_vwap_pct or 0) >= 0 else "red"
+                st.markdown(f"🟡 **VWAP:** ₹{_vwap_val:,.2f} &nbsp; :{_vc}[{_vwap_pct:+.2f}%]")
+            _sk_col = "green" if _sk < 30 else ("red" if _sk > 70 else "orange")
+            st.markdown(f"📊 **StochRSI:** K={_sk:.0f} &nbsp; D={_sd:.0f}")
+            st.markdown(f"📌 **ATR%:** {_atr:.2f}% (expected daily move)")
+    if mode in ("Intraday Picks (top 30)", "All NSE Stocks", "All NSE + SME") and r.get("intraday_reasons"):
+                st.markdown(f"🎯 **Intraday Score:** {r.get('intraday_pts', 0)} pts")
+                for _ir in r["intraday_reasons"]:
+                    st.markdown(f"  - {_ir}")
+
+            # ── Buy / Sell signal badge ───────────────────────────────────────
+            st.markdown("---")
+            _badge_css = {
+                "BUY":  "background:#0d3b26;color:#00e676;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
+                "SELL": "background:#3b0d0d;color:#ff5252;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
+                "HOLD": "background:#3b3b0d;color:#ffd600;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
+            }[r["signal"]]
+            st.markdown(f'<span style="{_badge_css}">{r["signal"]} &nbsp; {r["score"]:.0f}/100</span>', unsafe_allow_html=True)
+
+        # ── Candlestick chart (4 panels: Price, Volume, RSI, MACD) ──
         with chart_col:
-            df_c = r["_df"].tail(120).copy()
+            df_c = r["_df"].tail(150).copy()
 
             fig = make_subplots(
-                rows=3, cols=1,
+                rows=4, cols=1,
                 shared_xaxes=True,
-                row_heights=[0.6, 0.2, 0.2],
+                row_heights=[0.50, 0.17, 0.16, 0.17],
                 vertical_spacing=0.02,
+                subplot_titles=("", "Volume", "RSI (14)", "MACD (12/26/9)"),
             )
 
             # Candlestick
@@ -362,6 +484,13 @@ for r in results:
                     line=dict(color="#ce93d8", width=1, dash="dot"), name="SMA 200",
                 ), row=1, col=1)
 
+            # VWAP
+            if "VWAP" in df_c.columns:
+                fig.add_trace(go.Scatter(
+                    x=df_c.index, y=df_c["VWAP"],
+                    line=dict(color="#ffeb3b", width=1.5, dash="dash"), name="VWAP",
+                ), row=1, col=1)
+
             # Bollinger Bands
             fig.add_trace(go.Scatter(
                 x=df_c.index, y=df_c["BB_up"],
@@ -384,17 +513,17 @@ for r in results:
                 fig.add_hline(y=sup, line_dash="dash", line_color="rgba(38,166,154,0.6)",
                               line_width=1, row=1, col=1)
 
-            # Target / stop annotations on price axis
+            # Target / stop annotations
             fig.add_hline(y=r["proj_up"],   line_dash="dot", line_color="rgba(0,230,118,0.8)",
                           line_width=1.5, row=1, col=1,
-                          annotation_text=f"Target ₹{r['proj_up']:,.0f}",
-                          annotation_position="right")
+                          annotation_text=f"🎯 ₹{r['proj_up']:,.0f}",
+                          annotation_position="top right")
             fig.add_hline(y=r["proj_down"], line_dash="dot", line_color="rgba(255,82,82,0.8)",
                           line_width=1.5, row=1, col=1,
-                          annotation_text=f"Stop ₹{r['proj_down']:,.0f}",
-                          annotation_position="right")
+                          annotation_text=f"🛑 ₹{r['proj_down']:,.0f}",
+                          annotation_position="bottom right")
 
-            # Volume bars
+            # Volume bars (green/red)
             vol_colors = [
                 "#ef5350" if c < o else "#26a69a"
                 for c, o in zip(df_c["Close"], df_c["Open"])
@@ -403,31 +532,75 @@ for r in results:
                 x=df_c.index, y=df_c["Volume"],
                 marker_color=vol_colors, name="Volume", showlegend=False,
             ), row=2, col=1)
+            # Volume average line
+            if "Vol_avg" in df_c.columns:
+                fig.add_trace(go.Scatter(
+                    x=df_c.index, y=df_c["Vol_avg"],
+                    line=dict(color="rgba(255,235,59,0.7)", width=1, dash="dot"),
+                    name="Vol Avg", showlegend=False,
+                ), row=2, col=1)
 
             # RSI
             fig.add_trace(go.Scatter(
                 x=df_c.index, y=df_c["RSI"],
-                line=dict(color="#e91e63", width=1.2), name="RSI",
+                line=dict(color="#e91e63", width=1.5), name="RSI",
             ), row=3, col=1)
-            fig.add_hline(y=70, line_dash="dot", line_color="rgba(239,83,80,0.5)",  row=3, col=1)
-            fig.add_hline(y=30, line_dash="dot", line_color="rgba(38,166,154,0.5)", row=3, col=1)
+            if "RSI_smooth" in df_c.columns:
+                fig.add_trace(go.Scatter(
+                    x=df_c.index, y=df_c["RSI_smooth"],
+                    line=dict(color="rgba(233,30,99,0.4)", width=1), name="RSI Smooth",
+                    showlegend=False,
+                ), row=3, col=1)
+            fig.add_hline(y=70, line_dash="dot", line_color="rgba(239,83,80,0.6)",  row=3, col=1,
+                          annotation_text="70", annotation_position="right")
+            fig.add_hline(y=30, line_dash="dot", line_color="rgba(38,166,154,0.6)", row=3, col=1,
+                          annotation_text="30", annotation_position="right")
             fig.add_hrect(y0=30, y1=70, fillcolor="rgba(255,255,255,0.02)",
                           line_width=0, row=3, col=1)
 
+            # MACD histogram + lines
+            macd_colors = [
+                "#26a69a" if v >= 0 else "#ef5350"
+                for v in df_c["MACD_hist"].fillna(0)
+            ]
+            fig.add_trace(go.Bar(
+                x=df_c.index, y=df_c["MACD_hist"],
+                marker_color=macd_colors, name="MACD Hist", showlegend=False,
+            ), row=4, col=1)
+            fig.add_trace(go.Scatter(
+                x=df_c.index, y=df_c["MACD"],
+                line=dict(color="#2196f3", width=1.5), name="MACD",
+            ), row=4, col=1)
+            fig.add_trace(go.Scatter(
+                x=df_c.index, y=df_c["MACD_sig"],
+                line=dict(color="#ff9800", width=1.5), name="Signal",
+            ), row=4, col=1)
+            fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.25)", row=4, col=1)
+
             fig.update_layout(
-                height=420,
+                height=600,
                 template="plotly_dark",
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
-                margin=dict(l=0, r=60, t=10, b=0),
+                margin=dict(l=0, r=70, t=20, b=0),
                 xaxis_rangeslider_visible=False,
-                legend=dict(orientation="h", y=1.08, x=0, font_size=11),
+                legend=dict(orientation="h", y=1.06, x=0, font_size=11),
             )
             fig.update_yaxes(title_text="Volume", row=2, col=1, title_font_size=10)
             fig.update_yaxes(title_text="RSI",    row=3, col=1, range=[0, 100], title_font_size=10)
+            fig.update_yaxes(title_text="MACD",   row=4, col=1, title_font_size=10)
+            fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
+            fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
 
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True)
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.divider()
 st.caption("⚠️ This tool is for educational purposes only. Always do your own research before trading.")
+# ── Live monitor auto-refresh ──────────────────────────────────────────────────
+if live_monitor and st.session_state.get("live_active", False):
+    import time
+    _next = datetime.now().strftime("%H:%M:%S")
+    st.info(f"📗 Live monitor active — refreshing every {refresh_secs}s | Last scan: {_next}")
+    time.sleep(refresh_secs)
+    st.rerun()

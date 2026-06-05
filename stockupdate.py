@@ -169,6 +169,16 @@ NIFTY_50_FALLBACK = [
     "BAJAJ-AUTO", "HINDALCO", "UPL", "INDUSINDBK", "M&M",
 ]
 
+# ── High-liquidity Nifty stocks recommended for intraday trading ───────────
+NIFTY_INTRADAY_STOCKS = [
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
+    "AXISBANK", "SBIN", "KOTAKBANK", "BAJFINANCE", "LT",
+    "TATAMOTORS", "WIPRO", "HCLTECH", "NTPC", "POWERGRID",
+    "ONGC", "BPCL", "HINDUNILVR", "SUNPHARMA", "DRREDDY",
+    "TATASTEEL", "JSWSTEEL", "HINDALCO", "COALINDIA", "M&M",
+    "MARUTI", "EICHERMOT", "BAJAJ-AUTO", "HEROMOTOCO", "TITAN",
+]
+
 
 def fetch_nifty50_tickers() -> list[str]:
     """Fetch live Nifty 50 constituents from NSE India. Falls back to hardcoded list on error."""
@@ -202,6 +212,63 @@ def fetch_nifty50_tickers() -> list[str]:
               f"using cached Nifty 50 list{Style.RESET_ALL}")
     return list(NIFTY_50_FALLBACK)
 
+
+def fetch_all_nse_tickers(include_sme: bool = True) -> list[str]:
+    """
+    Fetch every NSE-listed equity from the latest available daily bhavcopy.
+    Mainboard stocks use the bare symbol (e.g. RELIANCE).
+    SME/Emerge stocks get a -SM suffix (e.g. PRANIK-SM) when include_sme=True.
+    Falls back to the Nifty 50 fallback list if the download fails.
+    """
+    import io
+    import zipfile
+
+    bhav_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://www.nseindia.com/",
+    }
+
+    for days_back in range(10):          # try up to 10 calendar days back
+        dt = date.today() - timedelta(days=days_back)
+        if dt.weekday() >= 5:            # skip Saturday / Sunday
+            continue
+        ds  = dt.strftime("%Y%m%d")
+        url = (f"https://nsearchives.nseindia.com/content/cm/"
+               f"BhavCopy_NSE_CM_0_0_0_{ds}_F_0000.csv.zip")
+        try:
+            resp = requests.get(url, headers=bhav_headers, timeout=25)
+            if resp.status_code != 200:
+                continue
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+                bhav = pd.read_csv(z.open(z.namelist()[0]), dtype=str)
+
+            bhav["SctySrs"]  = bhav["SctySrs"].str.strip().str.upper()
+            bhav["TckrSymb"] = bhav["TckrSymb"].str.strip().str.upper()
+
+            tickers: list[str] = []
+            tickers.extend(bhav.loc[bhav["SctySrs"] == "EQ", "TckrSymb"].tolist())
+            if include_sme:
+                tickers.extend(
+                    sym + "-SM"
+                    for sym in bhav.loc[bhav["SctySrs"] == "SM", "TckrSymb"].tolist()
+                )
+
+            tickers = sorted(set(tickers))
+            if len(tickers) > 100:       # sanity check — expect 1800+ EQ + 600+ SM
+                print(f"{Fore.CYAN}  ✓ Loaded {len(tickers)} NSE tickers "
+                      f"from bhavcopy ({dt}){Style.RESET_ALL}")
+                return tickers
+        except Exception as exc:
+            print(f"{Fore.YELLOW}  ⚠ bhavcopy fetch failed "
+                  f"({exc.__class__.__name__}), trying previous day{Style.RESET_ALL}")
+
+    print(f"{Fore.YELLOW}  ⚠ Could not fetch full NSE list; "
+          f"falling back to Nifty 50{Style.RESET_ALL}")
+    return list(NIFTY_50_FALLBACK)
+
+
 INTERVAL_PERIOD = {
     "1m":  "5d",
     "5m":  "60d",
@@ -227,6 +294,21 @@ _PERIOD_DAYS = {
     "1y":   365,
     "5y":   1825,
 }
+
+
+def get_nifty_index_data(interval: str = "1d") -> pd.DataFrame | None:
+    """Fetch Nifty 50 index (^NSEI) OHLCV data for dashboard display."""
+    try:
+        period = INTERVAL_PERIOD.get(interval, "1y")
+        df = yf.download("^NSEI", period=period, interval=interval,
+                         progress=False, auto_adjust=True)
+        if df is not None and not df.empty:
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            df.dropna(inplace=True)
+            return df
+    except Exception:
+        pass
+    return None
 
 
 # ── Data fetch ──────────────────────────────────────────────────────────────
@@ -701,6 +783,10 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["OBV"]       = (vol * direction).cumsum()
     df["OBV_ema"]   = df["OBV"].ewm(span=20).mean()
 
+    # ── VWAP (cumulative session approximation) ───────────────────────────────
+    typical_price  = (high + low + close) / 3
+    df["VWAP"]     = (typical_price * vol).cumsum() / vol.replace(0, float("nan")).cumsum()
+
     # ── Candle body analysis ──────────────────────────────────────────────────
     df["Body"]       = (close - open_).abs()
     df["Upper_wick"] = high  - close.where(close >= open_, open_)
@@ -803,6 +889,29 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
             sell_pts += 1
             sell_reasons.append(f"High volume ({vol_ratio:.1f}x avg) confirms SELL")
 
+    # 6. VWAP signal
+    vwap     = None
+    vwap_pct = None
+    if "VWAP" in df.columns and not pd.isna(r["VWAP"]):
+        vwap     = float(r["VWAP"])
+        vwap_pct = (price - vwap) / vwap * 100
+        if price > vwap * 1.003:
+            buy_pts += 1
+            buy_reasons.append(f"Price above VWAP ({vwap_pct:+.1f}%) — intraday bullish")
+        elif price < vwap * 0.997:
+            sell_pts += 1
+            sell_reasons.append(f"Price below VWAP ({vwap_pct:+.1f}%) — intraday bearish")
+
+    # 7. StochRSI confirmation
+    stoch_k = float(r["StochRSI_K"]) if not pd.isna(r["StochRSI_K"]) else 0.5
+    stoch_d = float(r["StochRSI_D"]) if not pd.isna(r["StochRSI_D"]) else 0.5
+    if stoch_k < 0.25 and stoch_k > stoch_d:
+        buy_pts += 1
+        buy_reasons.append(f"StochRSI oversold & turning up ({stoch_k*100:.0f})")
+    elif stoch_k > 0.75 and stoch_k < stoch_d:
+        sell_pts += 1
+        sell_reasons.append(f"StochRSI overbought & turning down ({stoch_k*100:.0f})")
+
     # ── Price projections ─────────────────────────────────────────────────────
     atr_val = float(r["ATR"]) if (not pd.isna(r["ATR"]) and r["ATR"] > 0) else price * 0.01
     sr          = find_support_resistance(df, price, atr_val)
@@ -884,6 +993,11 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
                                          trend_strong, proj_up_pct, proj_down_pct,
                                          proj_timeline, nearest_res, nearest_sup,
                                          buy_reasons, sell_reasons),
+        "vwap":           round(vwap, 2) if vwap is not None else None,
+        "vwap_pct":       round(vwap_pct, 2) if vwap_pct is not None else None,
+        "stoch_k":        round(stoch_k * 100, 1),
+        "stoch_d":        round(stoch_d * 100, 1),
+        "atr_pct":        round(float(r["ATR_pct"]) if not pd.isna(r["ATR_pct"]) else 0.0, 2),
     }
 
 
@@ -1000,6 +1114,82 @@ def _build_summary(signal, score, rsi, adx, vol_ratio, trend_strong,
         )
 
     return " ".join(lines)
+
+
+# ── Intraday setup evaluator ────────────────────────────────────────────────
+def intraday_setup_score(results: list[dict]) -> list[dict]:
+    """
+    Rank stocks by intraday trading potential.
+    Boosts stocks with high ATR%, volume surge, VWAP alignment,
+    and actionable RSI. Sorted descending by intraday score.
+    """
+    for r in results:
+        pts     = 0
+        reasons = []
+
+        # High ATR% = volatile = better intraday range
+        atr_pct = r.get("atr_pct", 0)
+        if atr_pct >= 2.0:
+            pts += 3
+            reasons.append(f"High volatility (ATR {atr_pct:.1f}%) — good intraday range")
+        elif atr_pct >= 1.0:
+            pts += 1
+            reasons.append(f"Moderate volatility (ATR {atr_pct:.1f}%)")
+
+        # Volume surge = strong participation
+        vol_ratio = r.get("vol_ratio", 1.0)
+        if vol_ratio >= 2.5:
+            pts += 3
+            reasons.append(f"Volume surge ({vol_ratio:.1f}x) — strong participation")
+        elif vol_ratio >= 1.5:
+            pts += 1
+            reasons.append(f"Above-avg volume ({vol_ratio:.1f}x)")
+
+        # RSI in actionable zone
+        rsi = r.get("rsi", 50)
+        if rsi < 35:
+            pts += 2
+            reasons.append(f"RSI oversold ({rsi}) — bounce candidate")
+        elif rsi > 65:
+            pts += 1
+            reasons.append(f"RSI strong ({rsi}) — momentum continuation")
+        elif 40 <= rsi <= 60:
+            pts += 1
+            reasons.append(f"RSI neutral ({rsi}) — room to move")
+
+        # VWAP alignment with signal
+        vwap_pct = r.get("vwap_pct")
+        signal   = r.get("signal", "HOLD")
+        if vwap_pct is not None:
+            if signal == "BUY" and vwap_pct > 0.3:
+                pts += 2
+                reasons.append(f"Above VWAP (+{vwap_pct:.1f}%) — intraday bullish bias")
+            elif signal == "SELL" and vwap_pct < -0.3:
+                pts += 2
+                reasons.append(f"Below VWAP ({vwap_pct:.1f}%) — intraday bearish bias")
+
+        # StochRSI momentum
+        stoch_k = r.get("stoch_k", 50)
+        stoch_d = r.get("stoch_d", 50)
+        if stoch_k < 25 and stoch_k > stoch_d:
+            pts += 1
+            reasons.append(f"StochRSI oversold & turning up ({stoch_k:.0f}) — buy momentum")
+        elif stoch_k > 75 and stoch_k < stoch_d:
+            pts += 1
+            reasons.append(f"StochRSI overbought & turning down ({stoch_k:.0f}) — sell momentum")
+
+        # Base signal strength bonus
+        base_score = r.get("score", 50)
+        if base_score >= 70:
+            pts += 2
+        elif base_score >= 60:
+            pts += 1
+
+        r["intraday_pts"]     = pts
+        r["intraday_reasons"] = reasons
+
+    results.sort(key=lambda x: -x.get("intraday_pts", 0))
+    return results
 
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
@@ -1133,6 +1323,14 @@ def main():
         description="Nifty 50 Buy/Sell Signal Generator"
     )
     parser.add_argument(
+        "--all-nse", action="store_true",
+        help="Scan all NSE mainboard (EQ) stocks fetched from today's bhavcopy"
+    )
+    parser.add_argument(
+        "--all-nse-sme", action="store_true",
+        help="Scan all NSE stocks including SME/Emerge (very large — slow)"
+    )
+    parser.add_argument(
         "--zerodha", action="store_true",
         help="Fetch and analyse stocks from your Zerodha portfolio"
     )
@@ -1159,7 +1357,13 @@ def main():
         zerodha_login()
         return
 
-    if args.zerodha:
+    if args.all_nse_sme:
+        print(f"{Fore.CYAN}  Fetching all NSE + SME tickers from bhavcopy...{Style.RESET_ALL}")
+        tickers = fetch_all_nse_tickers(include_sme=True)
+    elif args.all_nse:
+        print(f"{Fore.CYAN}  Fetching all NSE mainboard tickers from bhavcopy...{Style.RESET_ALL}")
+        tickers = fetch_all_nse_tickers(include_sme=False)
+    elif args.zerodha:
         tickers = fetch_zerodha_holdings()
     elif args.stocks:
         tickers = [t.upper() for t in args.stocks]
