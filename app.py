@@ -8,7 +8,7 @@ Then open http://localhost:8501 in your browser.
 
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -175,6 +175,19 @@ with st.sidebar:
         st.session_state["live_active"] = True
     elif not live_monitor:
         st.session_state.pop("live_active", None)
+
+    st.divider()
+    st.markdown("**📅 Prediction Comparison**")
+    compare_enabled = st.toggle("Compare predictions vs current price", value=False)
+    compare_date = None
+    if compare_enabled:
+        compare_date = st.date_input(
+            "Predict-from date",
+            value=date.today() - timedelta(days=30),
+            min_value=date(2010, 1, 1),
+            max_value=date.today() - timedelta(days=1),
+            help="Replay the scan as of this date and compare predicted targets against today's price.",
+        )
 
     st.divider()
     st.caption("ℹ️ Zerodha Portfolio: add api_key & api_secret to Streamlit Secrets, then log in from the sidebar.")
@@ -561,6 +574,40 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
                     "HOLD": "background:#3b3b0d;color:#ffd600;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
                 }[r["signal"]]
                 st.markdown(f'<span style="{_badge_css}">{r["signal"]} &nbsp; {r["score"]:.0f}/100</span>', unsafe_allow_html=True)
+
+                # ── Prediction comparison panel ───────────────────────────
+                if compare_date:
+                    _df_hist = r["_df"][r["_df"].index.normalize() <= pd.Timestamp(compare_date)]
+                    if len(_df_hist) >= MIN_ROWS:
+                        _df_hist  = compute_indicators(_df_hist)
+                        _hist_sig = generate_signal(_df_hist, interval)
+                        _hp       = _hist_sig["price"]
+                        _cp       = r["price"]
+                        _ret      = (_cp - _hp) / _hp * 100
+                        _tgt_hit  = _cp >= _hist_sig["proj_up"]
+                        _stp_hit  = _cp <= _hist_sig["proj_down"]
+                        _ret_col  = "green" if _ret >= 0 else "red"
+                        st.markdown("---")
+                        st.markdown(f"**📅 Comparison — as of {compare_date}:**")
+                        _sig_on_date = _hist_sig["signal"]
+                        _sig_clr = {"BUY": "green", "SELL": "red", "HOLD": "orange"}[_sig_on_date]
+                        st.markdown(
+                            f"Signal on date: :{_sig_clr}[**{_sig_on_date}**] &nbsp; "
+                            f"Price then: **₹{_hp:,.2f}**"
+                        )
+                        st.markdown(
+                            f"Predicted target: ₹{_hist_sig['proj_up']:,.2f} ({_hist_sig['proj_up_pct']:+.1f}%)  "
+                            f"&nbsp;|&nbsp;  Stop: ₹{_hist_sig['proj_down']:,.2f} ({_hist_sig['proj_down_pct']:+.1f}%)"
+                        )
+                        st.markdown(f"Current price: **₹{_cp:,.2f}**  &nbsp; Actual return: :{_ret_col}[**{_ret:+.2f}%**]")
+                        if _tgt_hit:
+                            st.success("✅ Target was hit!")
+                        elif _stp_hit:
+                            st.error("🛑 Stop-loss was triggered.")
+                        else:
+                            st.info("⏳ Neither target nor stop-loss reached yet.")
+                    else:
+                        st.caption(f"Not enough historical data before {compare_date} to compare.")
 
             # ── Candlestick chart (4 panels: Price, Volume, RSI, MACD) ──
             with chart_col:
