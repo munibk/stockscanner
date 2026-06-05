@@ -521,61 +521,60 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
         label    = f"{sig_icon}  **{r['ticker']}**  —  {r['signal']}  ({r['score']:.0f}/100)  ₹{r['price']:,.2f}"
 
         with st.expander(label, expanded=(len(results) == 1)):
-            info_col, chart_col = st.columns([1, 3])
+            _tab_detail, _tab_chart = st.tabs(["📋 Details", "📈 Chart"])
 
-            # ── Info panel (shown first so it stacks on top on mobile) ──
-            with info_col:
-                st.markdown(f"### {r['ticker']}")
-                sig_color = {"BUY": "green", "SELL": "red", "HOLD": "orange"}[r["signal"]]
-                st.markdown(f"**Signal:** :{sig_color}[{r['signal']}] &nbsp; Score: **{r['score']:.0f}/100**")
-                st.markdown(f"**RSI:** {r['rsi']}  |  **ADX:** {r['adx'] or '\u2014'}  |  **Vol:** {r['vol_ratio']}x")
-                st.markdown("---")
-                st.markdown(f"🎯 **Target:** ₹{r['proj_up']:,.2f}  ({r['proj_up_pct']:+.1f}%)  *{r['proj_timeline']}*")
-                st.markdown(f"🛑 **Stop:**   ₹{r['proj_down']:,.2f}  ({r['proj_down_pct']:+.1f}%)")
-                if r["resistances"]:
-                    st.markdown("🔴 **Resistance:** " + " | ".join(f"₹{v:,.2f}" for v in r["resistances"]))
-                if r["supports"]:
-                    st.markdown("🟢 **Support:**    " + " | ".join(f"₹{v:,.2f}" for v in r["supports"]))
-                st.markdown("---")
-                if r.get("summary"):
-                    icon = "🟢" if r["signal"] == "BUY" else ("🔴" if r["signal"] == "SELL" else "🟡")
-                    st.info(f"{icon} **In plain English:** {r['summary']}")
-                    st.markdown("---")
-                st.markdown("**Reasons:**")
-                for reason in r["reasons"]:
-                    # strip colorama tags if any leaked through
-                    clean = reason.replace("⚠ Against: ", "⚠️ *Against:* ")
-                    st.markdown(f"- {clean}")
-
-                # ── Intraday & technical indicators ──────────────────────────
-                st.markdown("---")
-                st.markdown("**Technical Indicators:**")
-                _vwap_val = r.get("vwap")
-                _vwap_pct = r.get("vwap_pct")
-                _sk       = r.get("stoch_k", 50)
-                _sd       = r.get("stoch_d", 50)
-                _atr      = r.get("atr_pct", 0)
-                if _vwap_val:
-                    _vc = "green" if (_vwap_pct or 0) >= 0 else "red"
-                    st.markdown(f"🟡 **VWAP:** ₹{_vwap_val:,.2f} &nbsp; :{_vc}[{_vwap_pct:+.2f}%]")
-                _sk_col = "green" if _sk < 30 else ("red" if _sk > 70 else "orange")
-                st.markdown(f"📊 **StochRSI:** K={_sk:.0f} &nbsp; D={_sd:.0f}")
-                st.markdown(f"📌 **ATR%:** {_atr:.2f}% (expected daily move)")
-                if mode in ("Intraday Picks (top 30)", "All NSE Stocks", "All NSE + SME") and r.get("intraday_reasons"):
-                    st.markdown(f"🎯 **Intraday Score:** {r.get('intraday_pts', 0)} pts")
-                    for _ir in r["intraday_reasons"]:
-                        st.markdown(f"  - {_ir}")
-
-                # ── Buy / Sell signal badge ───────────────────────────────────
-                st.markdown("---")
+            # ── Details tab (full width) ───────────────────────────────────
+            with _tab_detail:
+                sig_color  = {"BUY": "green", "SELL": "red", "HOLD": "orange"}[r["signal"]]
                 _badge_css = {
                     "BUY":  "background:#0d3b26;color:#00e676;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
                     "SELL": "background:#3b0d0d;color:#ff5252;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
                     "HOLD": "background:#3b3b0d;color:#ffd600;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
                 }[r["signal"]]
                 st.markdown(f'<span style="{_badge_css}">{r["signal"]} &nbsp; {r["score"]:.0f}/100</span>', unsafe_allow_html=True)
+                st.markdown("")
 
-                # ── Prediction comparison panel ───────────────────────────
+                _d_left, _d_right = st.columns([2, 3])
+
+                with _d_left:
+                    _m1, _m2, _m3 = st.columns(3)
+                    _m1.metric("RSI", r["rsi"])
+                    _m2.metric("ADX", r["adx"] or "—")
+                    _m3.metric("Vol", f"{r['vol_ratio']}x")
+                    st.markdown("---")
+                    st.markdown(f"🎯 **Target:** ₹{r['proj_up']:,.2f}  ({r['proj_up_pct']:+.1f}%)  *{r['proj_timeline']}*")
+                    st.markdown(f"🛑 **Stop:**   ₹{r['proj_down']:,.2f}  ({r['proj_down_pct']:+.1f}%)")
+                    if r["resistances"]:
+                        st.markdown("🔴 **Resistance:** " + " | ".join(f"₹{v:,.2f}" for v in r["resistances"]))
+                    if r["supports"]:
+                        st.markdown("🟢 **Support:**    " + " | ".join(f"₹{v:,.2f}" for v in r["supports"]))
+                    st.markdown("---")
+                    st.markdown("**Technical Indicators:**")
+                    _vwap_val = r.get("vwap")
+                    _vwap_pct = r.get("vwap_pct")
+                    _sk       = r.get("stoch_k", 50)
+                    _sd       = r.get("stoch_d", 50)
+                    _atr      = r.get("atr_pct", 0)
+                    if _vwap_val:
+                        _vc = "green" if (_vwap_pct or 0) >= 0 else "red"
+                        st.markdown(f"🟡 **VWAP:** ₹{_vwap_val:,.2f} &nbsp; :{_vc}[{_vwap_pct:+.2f}%]")
+                    st.markdown(f"📊 **StochRSI:** K={_sk:.0f} &nbsp; D={_sd:.0f}")
+                    st.markdown(f"📌 **ATR%:** {_atr:.2f}% (expected daily move)")
+                    if mode in ("Intraday Picks (top 30)", "All NSE Stocks", "All NSE + SME") and r.get("intraday_reasons"):
+                        st.markdown(f"🎯 **Intraday Score:** {r.get('intraday_pts', 0)} pts")
+                        for _ir in r["intraday_reasons"]:
+                            st.markdown(f"  - {_ir}")
+
+                with _d_right:
+                    if r.get("summary"):
+                        icon = "🟢" if r["signal"] == "BUY" else ("🔴" if r["signal"] == "SELL" else "🟡")
+                        st.info(f"{icon} **In plain English:** {r['summary']}")
+                    st.markdown("**Reasons:**")
+                    for reason in r["reasons"]:
+                        clean = reason.replace("⚠ Against: ", "⚠️ *Against:* ")
+                        st.markdown(f"- {clean}")
+
+                # ── Prediction comparison panel (full width) ──────────────
                 if compare_date:
                     _df_hist = r["_df"][r["_df"].index.normalize() <= pd.Timestamp(compare_date)]
                     if len(_df_hist) >= MIN_ROWS:
@@ -587,19 +586,14 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
                         _tgt_hit  = _cp >= _hist_sig["proj_up"]
                         _stp_hit  = _cp <= _hist_sig["proj_down"]
                         _ret_col  = "green" if _ret >= 0 else "red"
-                        st.markdown("---")
+                        st.divider()
                         st.markdown(f"**📅 Comparison — as of {compare_date}:**")
+                        _cmp1, _cmp2, _cmp3, _cmp4 = st.columns(4)
                         _sig_on_date = _hist_sig["signal"]
-                        _sig_clr = {"BUY": "green", "SELL": "red", "HOLD": "orange"}[_sig_on_date]
-                        st.markdown(
-                            f"Signal on date: :{_sig_clr}[**{_sig_on_date}**] &nbsp; "
-                            f"Price then: **₹{_hp:,.2f}**"
-                        )
-                        st.markdown(
-                            f"Predicted target: ₹{_hist_sig['proj_up']:,.2f} ({_hist_sig['proj_up_pct']:+.1f}%)  "
-                            f"&nbsp;|&nbsp;  Stop: ₹{_hist_sig['proj_down']:,.2f} ({_hist_sig['proj_down_pct']:+.1f}%)"
-                        )
-                        st.markdown(f"Current price: **₹{_cp:,.2f}**  &nbsp; Actual return: :{_ret_col}[**{_ret:+.2f}%**]")
+                        _cmp1.metric("Signal on date", _sig_on_date)
+                        _cmp2.metric("Price on date",  f"₹{_hp:,.2f}")
+                        _cmp3.metric("Predicted target", f"₹{_hist_sig['proj_up']:,.2f}")
+                        _cmp4.metric("Actual return",  f"{_ret:+.2f}%", delta=f"{_ret:+.2f}%")
                         if _tgt_hit:
                             st.success("✅ Target was hit!")
                         elif _stp_hit:
@@ -609,8 +603,8 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
                     else:
                         st.caption(f"Not enough historical data before {compare_date} to compare.")
 
-            # ── Candlestick chart (4 panels: Price, Volume, RSI, MACD) ──
-            with chart_col:
+            # ── Chart tab (full width) ─────────────────────────────────────
+            with _tab_chart:
                 df_c = r["_df"].tail(150).copy()
 
                 fig = make_subplots(
