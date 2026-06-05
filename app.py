@@ -180,8 +180,26 @@ with st.sidebar:
     st.caption("ℹ️ Zerodha Portfolio: add api_key & api_secret to Streamlit Secrets, then log in from the sidebar.")
 # ── Auto-run when live monitor is active ────────────────────────────────────────
 run = run or (live_monitor and st.session_state.get("live_active", False))
-# ── Welcome screen ────────────────────────────────────────────────────────────
-if not run:
+
+# ── Scan result cache (session-state backed, TTL per interval) ────────────────
+import time as _time
+
+_CACHE_TTL = {
+    "1m":  15 * 60,   "5m":  30 * 60,  "15m": 60 * 60,
+    "1h":  2  * 3600, "1d":  8  * 3600, "1wk": 24 * 3600,
+}
+_ck          = f"{mode}|{interval}"
+_ttl         = _CACHE_TTL.get(interval, 4 * 3600)
+_sc          = st.session_state.get("scan_cache", {})
+_cached      = _sc.get(_ck)
+_cache_fresh = (
+    _cached is not None
+    and not run                          # "Run Scan" click always bypasses cache
+    and (_time.time() - _cached["ts"]) < _ttl
+)
+
+# ── Welcome screen (skipped when cached data can be shown) ───────────────────
+if not run and not _cache_fresh:
     st.title("📈 Nifty Stock Signal Scanner")
     st.markdown("Configure options in the **sidebar** and click **Run Scan** to start.")
     st.divider()
@@ -191,49 +209,7 @@ if not run:
     col3.info("**Charts**\n\nInteractive candlestick with EMA20, EMA50, SMA200, Volume & RSI")
     st.stop()
 
-# ── Resolve ticker list ───────────────────────────────────────────────────────
-if mode == "Nifty 50":
-    with st.spinner("Fetching Nifty 50 constituents from NSE..."):
-        tickers = fetch_nifty50_tickers()
-
-elif mode == "Intraday Picks (top 30)":
-    tickers = list(NIFTY_INTRADAY_STOCKS)
-
-elif mode == "All NSE Stocks":
-    with st.spinner("Downloading NSE bhavcopy to get all listed stocks..."):
-        tickers = fetch_all_nse_tickers(include_sme=False)
-    st.info(f"📂 {len(tickers)} NSE mainboard stocks loaded. Large scan — may take several minutes.")
-
-elif mode == "All NSE + SME":
-    with st.spinner("Downloading NSE bhavcopy (mainboard + SME/Emerge)..."):
-        tickers = fetch_all_nse_tickers(include_sme=True)
-    st.info(f"📂 {len(tickers)} stocks loaded (mainboard + SME). Very large scan — may take 10–20+ minutes.")
-
-elif mode == "Custom Tickers":
-    raw     = custom_input.replace(",", " ").replace("\n", " ").split()
-    tickers = [t.upper().strip() for t in raw if t.strip()]
-    if not tickers:
-        st.error("Enter at least one ticker in the sidebar.")
-        st.stop()
-
-else:  # Zerodha Portfolio
-    if "kite_access_token" not in st.session_state:
-        st.warning("Please log in to Zerodha using the sidebar first.")
-        st.stop()
-    try:
-        tickers = fetch_zerodha_holdings_with_token(
-            st.session_state["kite_api_key"],
-            st.session_state["kite_access_token"],
-        )
-    except Exception as e:
-        st.error(f"Failed to fetch Zerodha holdings: {e}")
-        st.stop()
-    if not tickers:
-        st.warning("No holdings or open positions found in your Zerodha account.")
-        st.stop()
-
-
-# ── Signal cell styler (shared by live table and final table) ─────────────────
+# ── Signal cell styler (shared by live table, final table, and cache path) ────
 def _style_signal(val):
     if val == "BUY":
         return "background-color: #0d3b26; color: #00e676; font-weight: bold"
@@ -241,77 +217,138 @@ def _style_signal(val):
         return "background-color: #3b0d0d; color: #ff5252; font-weight: bold"
     return "background-color: #3b3b0d; color: #ffd600"
 
+# ── Fast path: load results from session-state cache ─────────────────────────
+if _cache_fresh:
+    results      = _cached["results"]
+    errors       = _cached["errors"]
+    newly_listed = _cached["newly_listed"]
+    _age         = int(_time.time() - _cached["ts"])
+    _mins, _secs = _age // 60, _age % 60
+    st.info(
+        f"Showing cached results ({_mins}m {_secs}s old) — "
+        f"click **Run Scan** to fetch fresh data."
+    )
 
-# ── Scan ──────────────────────────────────────────────────────────────────────
-results      = []
-errors       = []
-newly_listed = []
+# ── Resolve tickers + scan (skipped on cache hit) ────────────────────────────
+if not _cache_fresh:
+    if mode == "Nifty 50":
+        with st.spinner("Fetching Nifty 50 constituents from NSE..."):
+            tickers = fetch_nifty50_tickers()
 
-progress_bar  = st.progress(0, text="Starting scan...")
-live_status   = st.empty()
-live_table_ph = st.empty()
+    elif mode == "Intraday Picks (top 30)":
+        tickers = list(NIFTY_INTRADAY_STOCKS)
 
-# refresh the live table ~20 times across the full list
-_UPDATE_EVERY = max(1, min(10, max(1, len(tickers) // 20)))
+    elif mode == "All NSE Stocks":
+        with st.spinner("Downloading NSE bhavcopy to get all listed stocks..."):
+            tickers = fetch_all_nse_tickers(include_sme=False)
+        st.info(f"📂 {len(tickers)} NSE mainboard stocks loaded. Large scan — may take several minutes.")
 
-for i, ticker in enumerate(tickers):
-    pct = (i + 1) / len(tickers)
-    progress_bar.progress(pct, text=f"Scanning {ticker}  ({i+1}/{len(tickers)})")
-    try:
-        df = fetch_data(ticker, interval)
-    except _NewlyListedError as e:
-        newly_listed.append((e.ticker, e.rows))
-        continue
-    if df is None:
-        errors.append(ticker)
-        continue
-    df  = compute_indicators(df)
-    sig = generate_signal(df, interval)
-    sig["ticker"] = ticker
-    sig["_df"]    = df
-    results.append(sig)
+    elif mode == "All NSE + SME":
+        with st.spinner("Downloading NSE bhavcopy (mainboard + SME/Emerge)..."):
+            tickers = fetch_all_nse_tickers(include_sme=True)
+        st.info(f"📂 {len(tickers)} stocks loaded (mainboard + SME). Very large scan — may take 10–20+ minutes.")
 
-    # live table update every _UPDATE_EVERY stocks (and always on the last one)
-    if results and (len(results) % _UPDATE_EVERY == 0 or i == len(tickers) - 1):
-        _b = sum(1 for _r in results if _r["signal"] == "BUY")
-        _s = sum(1 for _r in results if _r["signal"] == "SELL")
-        _h = sum(1 for _r in results if _r["signal"] == "HOLD")
-        _skipped = len(newly_listed) + len(errors)
-        live_status.markdown(
-            f"**Scanned {i+1} / {len(tickers)}** "
-            f"&nbsp;|&nbsp; BUY **{_b}** &nbsp; HOLD **{_h}** &nbsp; SELL **{_s}**"
-            + (f" &nbsp;|&nbsp; Skipped {_skipped}" if _skipped else "")
-        )
-        _partial = sorted(
-            results,
-            key=lambda x: ({"BUY": 0, "HOLD": 1, "SELL": 2}[x["signal"]], -x["score"])
-        )[:20]
-        _live_rows = [
-            {
-                "Ticker":    _r["ticker"],
-                "Price":     f"\u20b9{_r['price']:,.2f}",
-                "Signal":    _r["signal"],
-                "Score":     _r["score"],
-                "RSI":       _r["rsi"],
-                "Vol":       f"{_r['vol_ratio']}x",
-                "Target":    f"\u20b9{_r['proj_up']:,.2f} ({_r['proj_up_pct']:+.1f}%)",
-                "Stop":      f"\u20b9{_r['proj_down']:,.2f} ({_r['proj_down_pct']:+.1f}%)",
-            }
-            for _r in _partial
-        ]
-        with live_table_ph.container():
-            st.caption(
-                f"Live results — top 20 of {len(results)} scanned "
-                f"(refreshes every {_UPDATE_EVERY} stocks)"
+    elif mode == "Custom Tickers":
+        raw     = custom_input.replace(",", " ").replace("\n", " ").split()
+        tickers = [t.upper().strip() for t in raw if t.strip()]
+        if not tickers:
+            st.error("Enter at least one ticker in the sidebar.")
+            st.stop()
+
+    else:  # Zerodha Portfolio
+        if "kite_access_token" not in st.session_state:
+            st.warning("Please log in to Zerodha using the sidebar first.")
+            st.stop()
+        try:
+            tickers = fetch_zerodha_holdings_with_token(
+                st.session_state["kite_api_key"],
+                st.session_state["kite_access_token"],
             )
-            st.dataframe(
-                pd.DataFrame(_live_rows).style.map(_style_signal, subset=["Signal"]),
-                use_container_width=True, hide_index=True,
-            )
+        except Exception as e:
+            st.error(f"Failed to fetch Zerodha holdings: {e}")
+            st.stop()
+        if not tickers:
+            st.warning("No holdings or open positions found in your Zerodha account.")
+            st.stop()
 
-progress_bar.empty()
-live_status.empty()
-live_table_ph.empty()   # full results section renders below
+    # ── Scan ──────────────────────────────────────────────────────────────────
+    results      = []
+    errors       = []
+    newly_listed = []
+
+    progress_bar  = st.progress(0, text="Starting scan...")
+    live_status   = st.empty()
+    live_table_ph = st.empty()
+
+    # refresh the live table ~20 times across the full list
+    _UPDATE_EVERY = max(1, min(10, max(1, len(tickers) // 20)))
+
+    for i, ticker in enumerate(tickers):
+        pct = (i + 1) / len(tickers)
+        progress_bar.progress(pct, text=f"Scanning {ticker}  ({i+1}/{len(tickers)})")
+        try:
+            df = fetch_data(ticker, interval)
+        except _NewlyListedError as e:
+            newly_listed.append((e.ticker, e.rows))
+            continue
+        if df is None:
+            errors.append(ticker)
+            continue
+        df  = compute_indicators(df)
+        sig = generate_signal(df, interval)
+        sig["ticker"] = ticker
+        sig["_df"]    = df
+        results.append(sig)
+
+        # live table update every _UPDATE_EVERY stocks (and always on the last one)
+        if results and (len(results) % _UPDATE_EVERY == 0 or i == len(tickers) - 1):
+            _b = sum(1 for _r in results if _r["signal"] == "BUY")
+            _s = sum(1 for _r in results if _r["signal"] == "SELL")
+            _h = sum(1 for _r in results if _r["signal"] == "HOLD")
+            _skipped = len(newly_listed) + len(errors)
+            live_status.markdown(
+                f"**Scanned {i+1} / {len(tickers)}** "
+                f"&nbsp;|&nbsp; BUY **{_b}** &nbsp; HOLD **{_h}** &nbsp; SELL **{_s}**"
+                + (f" &nbsp;|&nbsp; Skipped {_skipped}" if _skipped else "")
+            )
+            _partial = sorted(
+                results,
+                key=lambda x: ({"BUY": 0, "HOLD": 1, "SELL": 2}[x["signal"]], -x["score"])
+            )[:20]
+            _live_rows = [
+                {
+                    "Ticker":    _r["ticker"],
+                    "Price":     f"\u20b9{_r['price']:,.2f}",
+                    "Signal":    _r["signal"],
+                    "Score":     _r["score"],
+                    "RSI":       _r["rsi"],
+                    "Vol":       f"{_r['vol_ratio']}x",
+                    "Target":    f"\u20b9{_r['proj_up']:,.2f} ({_r['proj_up_pct']:+.1f}%)",
+                    "Stop":      f"\u20b9{_r['proj_down']:,.2f} ({_r['proj_down_pct']:+.1f}%)",
+                }
+                for _r in _partial
+            ]
+            with live_table_ph.container():
+                st.caption(
+                    f"Live results — top 20 of {len(results)} scanned "
+                    f"(refreshes every {_UPDATE_EVERY} stocks)"
+                )
+                st.dataframe(
+                    pd.DataFrame(_live_rows).style.map(_style_signal, subset=["Signal"]),
+                    use_container_width=True, hide_index=True,
+                )
+
+    progress_bar.empty()
+    live_status.empty()
+    live_table_ph.empty()   # full results section renders below
+
+    # ── Save scan results to session-state cache ───────────────────────────────
+    st.session_state.setdefault("scan_cache", {})[_ck] = {
+        "ts":          _time.time(),
+        "results":     results,
+        "errors":      errors,
+        "newly_listed": newly_listed,
+    }
 
 # ── Warnings / errors ────────────────────────────────────────────────────────
 for tkr, rows in newly_listed:
