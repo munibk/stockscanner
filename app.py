@@ -232,17 +232,31 @@ else:  # Zerodha Portfolio
         st.warning("No holdings or open positions found in your Zerodha account.")
         st.stop()
 
+
+# ── Signal cell styler (shared by live table and final table) ─────────────────
+def _style_signal(val):
+    if val == "BUY":
+        return "background-color: #0d3b26; color: #00e676; font-weight: bold"
+    if val == "SELL":
+        return "background-color: #3b0d0d; color: #ff5252; font-weight: bold"
+    return "background-color: #3b3b0d; color: #ffd600"
+
+
 # ── Scan ──────────────────────────────────────────────────────────────────────
 results      = []
 errors       = []
 newly_listed = []
 
-progress_bar = st.progress(0, text="Starting scan...")
-status_text  = st.empty()
+progress_bar  = st.progress(0, text="Starting scan...")
+live_status   = st.empty()
+live_table_ph = st.empty()
+
+# refresh the live table ~20 times across the full list
+_UPDATE_EVERY = max(1, min(10, max(1, len(tickers) // 20)))
 
 for i, ticker in enumerate(tickers):
     pct = (i + 1) / len(tickers)
-    progress_bar.progress(pct, text=f"Fetching {ticker}  ({i+1}/{len(tickers)})")
+    progress_bar.progress(pct, text=f"Scanning {ticker}  ({i+1}/{len(tickers)})")
     try:
         df = fetch_data(ticker, interval)
     except _NewlyListedError as e:
@@ -257,8 +271,47 @@ for i, ticker in enumerate(tickers):
     sig["_df"]    = df
     results.append(sig)
 
+    # live table update every _UPDATE_EVERY stocks (and always on the last one)
+    if results and (len(results) % _UPDATE_EVERY == 0 or i == len(tickers) - 1):
+        _b = sum(1 for _r in results if _r["signal"] == "BUY")
+        _s = sum(1 for _r in results if _r["signal"] == "SELL")
+        _h = sum(1 for _r in results if _r["signal"] == "HOLD")
+        _skipped = len(newly_listed) + len(errors)
+        live_status.markdown(
+            f"**Scanned {i+1} / {len(tickers)}** "
+            f"&nbsp;|&nbsp; BUY **{_b}** &nbsp; HOLD **{_h}** &nbsp; SELL **{_s}**"
+            + (f" &nbsp;|&nbsp; Skipped {_skipped}" if _skipped else "")
+        )
+        _partial = sorted(
+            results,
+            key=lambda x: ({"BUY": 0, "HOLD": 1, "SELL": 2}[x["signal"]], -x["score"])
+        )[:20]
+        _live_rows = [
+            {
+                "Ticker":    _r["ticker"],
+                "Price":     f"\u20b9{_r['price']:,.2f}",
+                "Signal":    _r["signal"],
+                "Score":     _r["score"],
+                "RSI":       _r["rsi"],
+                "Vol":       f"{_r['vol_ratio']}x",
+                "Target":    f"\u20b9{_r['proj_up']:,.2f} ({_r['proj_up_pct']:+.1f}%)",
+                "Stop":      f"\u20b9{_r['proj_down']:,.2f} ({_r['proj_down_pct']:+.1f}%)",
+            }
+            for _r in _partial
+        ]
+        with live_table_ph.container():
+            st.caption(
+                f"Live results — top 20 of {len(results)} scanned "
+                f"(refreshes every {_UPDATE_EVERY} stocks)"
+            )
+            st.dataframe(
+                pd.DataFrame(_live_rows).style.map(_style_signal, subset=["Signal"]),
+                use_container_width=True, hide_index=True,
+            )
+
 progress_bar.empty()
-status_text.empty()
+live_status.empty()
+live_table_ph.empty()   # full results section renders below
 
 # ── Warnings / errors ────────────────────────────────────────────────────────
 for tkr, rows in newly_listed:
@@ -371,13 +424,6 @@ for r in results:
     table_rows.append(row)
 
 df_table = pd.DataFrame(table_rows)
-
-def _style_signal(val):
-    if val == "BUY":
-        return "background-color: #0d3b26; color: #00e676; font-weight: bold"
-    if val == "SELL":
-        return "background-color: #3b0d0d; color: #ff5252; font-weight: bold"
-    return "background-color: #3b3b0d; color: #ffd600"
 
 styled_table = df_table.style.map(_style_signal, subset=["Signal"])
 st.dataframe(styled_table, use_container_width=True, hide_index=True)
