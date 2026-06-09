@@ -476,6 +476,27 @@ _grouped = _dd(list)
 for r in results:
     _grouped[_price_band(r["price"])].append(r)
 
+# ── Cap per-stock detail cards on large scans ─────────────────────────────────
+# Rendering a full Plotly chart per stock inside an expander is eager in Streamlit
+# (collapsed expanders still render). For All-NSE universes (1,800–2,400+ stocks)
+# this hangs the browser and triggers Cloud OOM restarts. Only render detail cards
+# for the top-ranked subset; every stock still appears in the summary tables.
+_BIG_MODES   = ("All NSE Stocks", "All NSE + SME")
+_MAX_DETAILS = 60 if mode in _BIG_MODES else 150
+_detail_tickers = {r["ticker"] for r in results[:_MAX_DETAILS]}
+_details_capped = len(results) > len(_detail_tickers)
+
+if _details_capped:
+    st.info(
+        f"📊 Showing full detail cards (with charts) for the top **{len(_detail_tickers)}** "
+        f"of {len(results)} stocks to keep the app responsive. "
+        f"All {len(results)} stocks are listed in the summary tables below."
+    )
+    # Free memory: drop cached candle data for stocks that won't be charted.
+    for r in results:
+        if r["ticker"] not in _detail_tickers:
+            r["_df"] = None
+
 # ── Display results grouped by price band ─────────────────────────────────────
 for _lo, _hi, _band_lbl in _PRICE_BANDS:
     _band_rs = _grouped.get(_band_lbl, [])
@@ -521,6 +542,8 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
 
     # Per-stock detail + chart for this band
     for r in _band_rs:
+        if r["ticker"] not in _detail_tickers:
+            continue
         sig_icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡", "VOID": "⚫"}.get(r["signal"], "🟡")
         label    = f"{sig_icon}  **{r['ticker']}**  —  {r['signal']}  ({r['score']:.0f}/100)  ₹{r['price']:,.2f}"
 
