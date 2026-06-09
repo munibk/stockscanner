@@ -328,7 +328,7 @@ if not _cache_fresh:
             )
             _partial = sorted(
                 results,
-                key=lambda x: ({"BUY": 0, "HOLD": 1, "SELL": 2}[x["signal"]], -x["score"])
+                key=lambda x: ({"BUY": 0, "HOLD": 1, "SELL": 2, "VOID": 3}.get(x["signal"], 4), -x["score"])
             )[:20]
             _live_rows = [
                 {
