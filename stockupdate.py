@@ -9,15 +9,18 @@ Fetches live NSE data and generates signals using:
   - Support / Resistance (Swing levels, Pivot Points, Round numbers)
 
 Requirements:
-    pip install yfinance pandas ta colorama tabulate requests kiteconnect
+    pip install yfinance pandas colorama tabulate requests kiteconnect
 
 Usage:
-    python nifty_signals.py                        # Scan all Nifty 50 stocks
-    python nifty_signals.py --stocks RELIANCE TCS  # Specific stocks
-    python nifty_signals.py --top 10               # Show top 10 BUY signals
-    python nifty_signals.py --interval 1h          # Use 1h candles (default: 1d)
-    python nifty_signals.py --zerodha-login        # One-time daily login to Zerodha
-    python nifty_signals.py --zerodha              # Analyse your Zerodha portfolio
+    python stockupdate.py                        # Scan all Nifty 50 stocks
+    python stockupdate.py --stocks RELIANCE TCS  # Specific stocks
+    python stockupdate.py --top 10               # Show top 10 BUY signals
+    python stockupdate.py --interval 1h          # Use 1h candles (default: 1d)
+    python stockupdate.py --zerodha-login        # One-time daily login to Zerodha
+    python stockupdate.py --zerodha              # Analyse your Zerodha portfolio
+
+To validate the strategy before risking capital, run the walk-forward backtester:
+    python backtest.py --stocks RELIANCE TCS --interval 1d
 """
 
 import argparse
@@ -699,7 +702,10 @@ def find_support_resistance(df: pd.DataFrame, price: float, atr: float) -> dict:
     }
 
 # ── Indicator calculation (pure pandas/numpy — no external ta library) ────────
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+_INTRADAY_INTERVALS = ("1m", "5m", "15m", "1h")
+
+
+def compute_indicators(df: pd.DataFrame, interval: str = "1d") -> pd.DataFrame:
     close = df["Close"]
     high  = df["High"]
     low   = df["Low"]
@@ -769,9 +775,20 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["OBV"]       = (vol * direction).cumsum()
     df["OBV_ema"]   = df["OBV"].ewm(span=20).mean()
 
-    # ── VWAP (cumulative session approximation) ───────────────────────────────
-    typical_price  = (high + low + close) / 3
-    df["VWAP"]     = (typical_price * vol).cumsum() / vol.replace(0, float("nan")).cumsum()
+    # ── VWAP ──────────────────────────────────────────────────────────────────
+    # VWAP is an intraday measure and MUST reset at each session (calendar day)
+    # boundary. Accumulating it across the whole history (the previous behaviour)
+    # produced a meaningless lifetime average. On daily/weekly bars a single
+    # candle already equals one session, so VWAP is undefined there — we leave it
+    # NaN and the mean-reversion logic transparently skips it.
+    typical_price = (high + low + close) / 3
+    if interval in _INTRADAY_INTERVALS and isinstance(df.index, pd.DatetimeIndex):
+        session = df.index.normalize()
+        cum_tpv = (typical_price * vol).groupby(session).cumsum()
+        cum_vol = vol.groupby(session).cumsum().replace(0, float("nan"))
+        df["VWAP"] = cum_tpv / cum_vol
+    else:
+        df["VWAP"] = float("nan")
 
     # ── Candle body analysis ──────────────────────────────────────────────────
     df["Body"]       = (close - open_).abs()
@@ -785,14 +802,21 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["BoS_bear"] = close < low.shift(1).rolling(_bos_win).min()
 
     # ── RSI Divergence ────────────────────────────────────────────────────────
+    # Price makes a fresh extreme but RSI does not confirm it. We additionally
+    # require RSI to sit in the half of its range where the divergence is
+    # actually meaningful (bullish div only matters when momentum is already
+    # weak, bearish div only when momentum is already stretched). This filters
+    # out a large share of the false positives the naive version produced.
     _div_win = 14
     df["RSI_bull_div"] = (
         (close <= close.rolling(_div_win).min() * 1.005) &
-        (df["RSI"] > df["RSI"].rolling(_div_win).min() + 5)
+        (df["RSI"] > df["RSI"].rolling(_div_win).min() + 5) &
+        (df["RSI"] < 50)
     )
     df["RSI_bear_div"] = (
         (close >= close.rolling(_div_win).max() * 0.995) &
-        (df["RSI"] < df["RSI"].rolling(_div_win).max() - 5)
+        (df["RSI"] < df["RSI"].rolling(_div_win).max() - 5) &
+        (df["RSI"] > 50)
     )
 
     return df
@@ -937,8 +961,16 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
         )
 
     # ── Layer 1: Regime Classification ───────────────────────────────────────
+    # A strong ADX tells us a trend EXISTS; SMA200 (or EMA50 when <200 bars are
+    # available) tells us its DIRECTION. The old code defaulted to "downtrend"
+    # whenever SMA200 was missing, which mislabelled strong rallies on short
+    # histories (e.g. intraday or newly listed stocks) and wrongly suppressed BUYs.
     if adx >= 25:
-        regime = "uptrend" if (sma200 and price > sma200) else "downtrend"
+        if sma200 is not None:
+            trend_up = price > sma200
+        else:
+            trend_up = price > ema50
+        regime = "uptrend" if trend_up else "downtrend"
     elif adx < 20:
         regime = "ranging"
     else:
@@ -1060,27 +1092,44 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
     sell_score += mr_sell * W_MR
 
     # Dim 5: Volume (10%)
-    W_VOL    = 0.10
-    obv_bull = False
+    # Volume is directionally neutral on its own — it CONFIRMS the side that OBV
+    # is leaning toward. We read OBV direction symmetrically: rising-and-above-EMA
+    # is bullish confirmation, falling-and-below-EMA is bearish confirmation, and
+    # anything mixed (e.g. flat OBV) contributes nothing rather than defaulting to
+    # "sell" the way the old code did.
+    W_VOL     = 0.10
+    obv_bull  = False
+    obv_bear  = False
     if "OBV" in df.columns and "OBV_ema" in df.columns:
         obv_now  = float(r["OBV"])
         obv_ema  = float(r["OBV_ema"])
         obv_prev = float(p["OBV"])
         obv_bull = (obv_now > obv_ema) and (obv_now > obv_prev)
+        obv_bear = (obv_now < obv_ema) and (obv_now < obv_prev)
     if vol_ratio >= 1.5:
         if obv_bull:
             buy_score  += W_VOL
-            reasons.append(f"High volume ({vol_ratio:.1f}x) + OBV trending up — confirms move")
-        else:
+            reasons.append(f"High volume ({vol_ratio:.1f}x) + OBV trending up — confirms buying")
+        elif obv_bear:
             sell_score += W_VOL
-            reasons.append(f"High volume ({vol_ratio:.1f}x) + OBV trending down — confirms sell pressure")
-    elif vol_ratio >= 0.7:
-        buy_score  += W_VOL * 0.5 if obv_bull  else 0.0
-        sell_score += W_VOL * 0.5 if not obv_bull else 0.0
+            reasons.append(f"High volume ({vol_ratio:.1f}x) + OBV trending down — confirms selling")
+    elif vol_ratio >= 0.8:
+        if obv_bull:
+            buy_score  += W_VOL * 0.5
+        elif obv_bear:
+            sell_score += W_VOL * 0.5
 
     # ── Map to 0–100 score ────────────────────────────────────────────────────
-    total_dim = buy_score + sell_score
-    score_pct = (buy_score / total_dim * 100) if total_dim > 0 else 50.0
+    # Score reflects NET CONVICTION, not the buy share of active factors.
+    # buy_score and sell_score each range ~0..1 (dimension weights sum to 1), so
+    # net ∈ [-1, +1] and maps linearly onto 0..100 around a neutral 50.
+    #   • net  0.00 → 50  (balanced / no edge)
+    #   • net +0.30 → 65  (BUY threshold — e.g. a full trend dimension)
+    #   • net -0.30 → 35  (SELL threshold)
+    # This stops a weak one-sided reading from scoring like a strong setup, and
+    # stops a genuinely strong-but-mixed reading from collapsing to a false HOLD.
+    net_score = buy_score - sell_score
+    score_pct = max(0.0, min(100.0, 50.0 + net_score * 50.0))
 
     # ── Regime gating (Layer 1 enforcement) ──────────────────────────────────
     if regime == "uptrend" and score_pct <= 35:
@@ -1417,7 +1466,7 @@ def scan(tickers: list[str], interval: str, top: int | None) -> None:
         if df is None:
             errors.append(ticker)
             continue
-        df = compute_indicators(df)
+        df = compute_indicators(df, interval)
         sig = generate_signal(df, interval)
         sig["ticker"] = ticker
         results.append(sig)

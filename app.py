@@ -309,7 +309,7 @@ if not _cache_fresh:
         if df is None:
             errors.append(ticker)
             continue
-        df  = compute_indicators(df)
+        df  = compute_indicators(df, interval)
         sig = generate_signal(df, interval)
         sig["ticker"] = ticker
         sig["_df"]    = df
@@ -635,30 +635,57 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
 
                 # ── Prediction comparison panel (full width) ──────────────
                 if compare_date:
-                    _df_hist = r["_df"][r["_df"].index.normalize() <= pd.Timestamp(compare_date)]
+                    _all_df   = r["_df"]
+                    _hist_mask = _all_df.index.normalize() <= pd.Timestamp(compare_date)
+                    _df_hist  = _all_df[_hist_mask]
+                    _df_future = _all_df[~_hist_mask]
                     if len(_df_hist) >= MIN_ROWS:
-                        _df_hist  = compute_indicators(_df_hist)
+                        _df_hist  = compute_indicators(_df_hist, interval)
                         _hist_sig = generate_signal(_df_hist, interval)
                         _hp       = _hist_sig["price"]
                         _cp       = r["price"]
                         _ret      = (_cp - _hp) / _hp * 100
-                        _tgt_hit  = _cp >= _hist_sig["proj_up"]
-                        _stp_hit  = _cp <= _hist_sig["proj_down"]
-                        _ret_col  = "green" if _ret >= 0 else "red"
+                        _sig_on_date = _hist_sig["signal"]
+                        _tgt = _hist_sig.get("target1")
+                        _stp = _hist_sig.get("stop_loss")
+
+                        # Direction- and path-aware outcome: walk the bars AFTER
+                        # the comparison date and see whether target or stop was
+                        # touched first (using each bar's High/Low, not just the
+                        # latest close). This matches how a real trade resolves.
+                        _outcome = "open"
+                        if _sig_on_date in ("BUY", "SELL") and _tgt and _stp and len(_df_future):
+                            for _, _bar in _df_future.iterrows():
+                                _hi, _lo = float(_bar["High"]), float(_bar["Low"])
+                                if _sig_on_date == "BUY":
+                                    _hit_stop = _lo <= _stp
+                                    _hit_tgt  = _hi >= _tgt
+                                else:  # SELL / short
+                                    _hit_stop = _hi >= _stp
+                                    _hit_tgt  = _lo <= _tgt
+                                if _hit_stop and _hit_tgt:
+                                    _outcome = "stop"   # assume worst case on same-bar ambiguity
+                                    break
+                                if _hit_tgt:
+                                    _outcome = "target"; break
+                                if _hit_stop:
+                                    _outcome = "stop"; break
+
                         st.divider()
                         st.markdown(f"**📅 Comparison — as of {compare_date}:**")
                         _cmp1, _cmp2, _cmp3, _cmp4 = st.columns(4)
-                        _sig_on_date = _hist_sig["signal"]
                         _cmp1.metric("Signal on date", _sig_on_date)
                         _cmp2.metric("Price on date",  f"₹{_hp:,.2f}")
-                        _cmp3.metric("Predicted target", f"₹{_hist_sig['proj_up']:,.2f}")
+                        _cmp3.metric("Target", f"₹{_tgt:,.2f}" if _tgt else "—")
                         _cmp4.metric("Actual return",  f"{_ret:+.2f}%", delta=f"{_ret:+.2f}%")
-                        if _tgt_hit:
-                            st.success("✅ Target was hit!")
-                        elif _stp_hit:
-                            st.error("🛑 Stop-loss was triggered.")
+                        if _sig_on_date not in ("BUY", "SELL"):
+                            st.info("No actionable BUY/SELL signal was generated on that date.")
+                        elif _outcome == "target":
+                            st.success("✅ Target was hit before the stop-loss.")
+                        elif _outcome == "stop":
+                            st.error("🛑 Stop-loss was triggered before the target.")
                         else:
-                            st.info("⏳ Neither target nor stop-loss reached yet.")
+                            st.info("⏳ Neither target nor stop-loss reached yet — trade still open.")
                     else:
                         st.caption(f"Not enough historical data before {compare_date} to compare.")
 
