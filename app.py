@@ -6,6 +6,7 @@ Run with:
 Then open http://localhost:8501 in your browser.
 """
 
+import importlib
 import sys
 import os
 from datetime import datetime, date, timedelta
@@ -16,6 +17,15 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Streamlit Cloud keeps imported modules cached in the running process across
+# reruns, so edits to stockupdate.py are not always picked up on a redeploy
+# (a stale module then mismatches the names app.py expects, e.g. a changed
+# function signature). Reloading here guarantees we always bind to the version
+# of stockupdate.py currently on disk.
+import stockupdate as _stockupdate
+importlib.reload(_stockupdate)
+
 from stockupdate import (
     fetch_nifty50_tickers,
     fetch_all_nse_tickers,
