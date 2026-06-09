@@ -217,7 +217,7 @@ if not run and not _cache_fresh:
     st.markdown("Configure options in the **sidebar** and click **Run Scan** to start.")
     st.divider()
     col1, col2, col3 = st.columns(3)
-    col1.info("**Signals**\n\nBUY / HOLD / SELL with confidence score based on RSI, MACD, EMAs, Volume & ADX")
+    col1.info("**Signals**\n\nBUY / HOLD / SELL / VOID with 4-layer regime-aware scoring: ADX regime gate → HTF daily filter → 5-dimension scoring → ATR trade plan")
     col2.info("**Price Targets**\n\nSupport & Resistance zones from swing levels, pivot points & round numbers")
     col3.info("**Charts**\n\nInteractive candlestick with EMA20, EMA50, SMA200, Volume & RSI")
     st.stop()
@@ -228,6 +228,8 @@ def _style_signal(val):
         return "background-color: #0d3b26; color: #00e676; font-weight: bold"
     if val == "SELL":
         return "background-color: #3b0d0d; color: #ff5252; font-weight: bold"
+    if val == "VOID":
+        return "background-color: #1a1a1a; color: #888888; font-weight: bold"
     return "background-color: #3b3b0d; color: #ffd600"
 
 # ── Fast path: load results from session-state cache ─────────────────────────
@@ -376,8 +378,8 @@ if not results:
     st.stop()
 
 # ── Sort ──────────────────────────────────────────────────────────────────────
-order = {"BUY": 0, "HOLD": 1, "SELL": 2}
-results.sort(key=lambda x: (order[x["signal"]], -x["score"]))
+order = {"BUY": 0, "HOLD": 1, "SELL": 2, "VOID": 3}
+results.sort(key=lambda x: (order.get(x["signal"], 4), -x["score"]))
 
 if top_n > 0:
     results = [r for r in results if r["signal"] == "BUY"][:int(top_n)]
@@ -440,12 +442,14 @@ st.title("📈 Scan Results")
 buys  = sum(1 for r in results if r["signal"] == "BUY")
 sells = sum(1 for r in results if r["signal"] == "SELL")
 holds = sum(1 for r in results if r["signal"] == "HOLD")
+voids = sum(1 for r in results if r["signal"] == "VOID")
 
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Stocks Scanned", len(results))
 m2.metric("🟢 BUY",  buys)
 m3.metric("🟡 HOLD", holds)
 m4.metric("🔴 SELL", sells)
+m5.metric("⚫ VOID",  voids)
 
 st.divider()
 
@@ -517,7 +521,7 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
 
     # Per-stock detail + chart for this band
     for r in _band_rs:
-        sig_icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}[r["signal"]]
+        sig_icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡", "VOID": "⚫"}.get(r["signal"], "🟡")
         label    = f"{sig_icon}  **{r['ticker']}**  —  {r['signal']}  ({r['score']:.0f}/100)  ₹{r['price']:,.2f}"
 
         with st.expander(label, expanded=(len(results) == 1)):
@@ -525,12 +529,13 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
 
             # ── Details tab (full width) ───────────────────────────────────
             with _tab_detail:
-                sig_color  = {"BUY": "green", "SELL": "red", "HOLD": "orange"}[r["signal"]]
+                sig_color  = {"BUY": "green", "SELL": "red", "HOLD": "orange", "VOID": "gray"}.get(r["signal"], "orange")
                 _badge_css = {
                     "BUY":  "background:#0d3b26;color:#00e676;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
                     "SELL": "background:#3b0d0d;color:#ff5252;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
                     "HOLD": "background:#3b3b0d;color:#ffd600;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
-                }[r["signal"]]
+                    "VOID": "background:#1a1a1a;color:#888888;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
+                }.get(r["signal"], "background:#3b3b0d;color:#ffd600;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem")
                 st.markdown(f'<span style="{_badge_css}">{r["signal"]} &nbsp; {r["score"]:.0f}/100</span>', unsafe_allow_html=True)
                 st.markdown("")
 
@@ -552,14 +557,45 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
                     st.markdown("**Technical Indicators:**")
                     _vwap_val = r.get("vwap")
                     _vwap_pct = r.get("vwap_pct")
-                    _sk       = r.get("stoch_k", 50)
-                    _sd       = r.get("stoch_d", 50)
                     _atr      = r.get("atr_pct", 0)
                     if _vwap_val:
                         _vc = "green" if (_vwap_pct or 0) >= 0 else "red"
                         st.markdown(f"🟡 **VWAP:** ₹{_vwap_val:,.2f} &nbsp; :{_vc}[{_vwap_pct:+.2f}%]")
-                    st.markdown(f"📊 **StochRSI:** K={_sk:.0f} &nbsp; D={_sd:.0f}")
+                    _regime_lbl  = r.get("regime", "—").title()
+                    _regime_icon = {
+                        "Uptrend": "📈", "Downtrend": "📉", "Ranging": "↔️",
+                        "Transitional": "⏳", "Void": "⚫"
+                    }.get(_regime_lbl, "📊")
+                    st.markdown(f"{_regime_icon} **Regime:** {_regime_lbl}")
+                    _bos_str = (
+                        "✅ Bullish BoS" if r.get("bos_bull") else
+                        ("🔻 Bearish BoS" if r.get("bos_bear") else "None")
+                    )
+                    st.markdown(f"📐 **Structure:** {_bos_str}")
+                    _div_str = (
+                        "📉 Bullish Div" if r.get("rsi_bull_div") else
+                        ("📈 Bearish Div" if r.get("rsi_bear_div") else "None")
+                    )
+                    st.markdown(f"🔀 **RSI Divergence:** {_div_str}")
                     st.markdown(f"📌 **ATR%:** {_atr:.2f}% (expected daily move)")
+                    _sl = r.get("stop_loss")
+                    _t1 = r.get("target1")
+                    _t2 = r.get("target2")
+                    _rr = r.get("rr_ratio", 0)
+                    if _sl and _t1 and _t2 and r["signal"] in ("BUY", "SELL"):
+                        st.markdown("---")
+                        st.markdown("**ATR Trade Plan:**")
+                        if r["signal"] == "BUY":
+                            st.markdown(f"🛑 **Stop Loss:** ₹{_sl:,.2f}  (ATR×1.5 below entry)")
+                            st.markdown(f"🎯 **Target 1:** ₹{_t1:,.2f}  (ATR×2.0)")
+                            st.markdown(f"🎯 **Target 2:** ₹{_t2:,.2f}  (ATR×3.5)")
+                        else:
+                            st.markdown(f"🛑 **Stop Loss:** ₹{_sl:,.2f}  (ATR×1.5 above entry)")
+                            st.markdown(f"🎯 **Target 1:** ₹{_t1:,.2f}  (ATR×2.0 below)")
+                            st.markdown(f"🎯 **Target 2:** ₹{_t2:,.2f}  (ATR×3.5 below)")
+                        st.markdown(f"📊 **R:R Ratio:** {_rr:.2f}:1")
+                        if _rr < 1.3:
+                            st.warning(f"⚠️ R:R {_rr:.2f} is below minimum 1.3 — poor risk/reward")
                     if mode in ("Intraday Picks (top 30)", "All NSE Stocks", "All NSE + SME") and r.get("intraday_reasons"):
                         st.markdown(f"🎯 **Intraday Score:** {r.get('intraday_pts', 0)} pts")
                         for _ir in r["intraday_reasons"]:
@@ -567,7 +603,7 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
 
                 with _d_right:
                     if r.get("summary"):
-                        icon = "🟢" if r["signal"] == "BUY" else ("🔴" if r["signal"] == "SELL" else "🟡")
+                        icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡", "VOID": "⚫"}.get(r["signal"], "🟡")
                         st.info(f"{icon} **In plain English:** {r['summary']}")
                     st.markdown("**Reasons:**")
                     for reason in r["reasons"]:
