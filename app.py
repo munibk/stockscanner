@@ -54,6 +54,10 @@ from watchlist import (
     is_watched,
 )
 
+# Default liquidity floor applied to All-NSE / All-NSE+SME scans when the user
+# hasn't set their own "Min avg daily volume" (keeps the huge universe tradable).
+_DEFAULT_NSE_MIN_VOL = 50_000
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Stock Signal Scanner",
@@ -204,6 +208,12 @@ with st.sidebar:
              "For All-NSE / SME scans this ALSO pre-filters the bhavcopy by that "
              "day's traded volume, so illiquid names are dropped before fetching "
              "(much faster). Zero-volume stocks are always excluded.",
+    )
+    min_turnover_cr = st.number_input(
+        "Min daily turnover (₹ crore, 0 = off)", min_value=0.0, value=0.0, step=0.5,
+        help="Price-normalized liquidity filter (better than share count): drops "
+             "stocks whose bhavcopy turnover value that day is below this. "
+             "Applies to All-NSE / SME scans. ₹1 crore ≈ a reasonable liquidity floor.",
     )
 
     st.divider()
@@ -475,7 +485,7 @@ _CACHE_TTL = {
     "1m":  15 * 60,   "5m":  30 * 60,  "15m": 60 * 60,
     "1h":  2  * 3600, "1d":  8  * 3600, "1wk": 24 * 3600,
 }
-_ck          = f"{mode}|{interval}|v{int(exclude_void)}{int(require_vol_confirm)}{int(min_avg_vol)}"
+_ck          = f"{mode}|{interval}|v{int(exclude_void)}{int(require_vol_confirm)}{int(min_avg_vol)}t{min_turnover_cr}"
 _ttl         = _CACHE_TTL.get(interval, 4 * 3600)
 _sc          = st.session_state.get("scan_cache", {})
 _cached      = _sc.get(_ck)
@@ -519,18 +529,28 @@ if not _cache_fresh:
         tickers = list(NIFTY_INTRADAY_STOCKS)
 
     elif mode == "All NSE Stocks":
+        # Default to a sensible liquidity floor so the huge NSE universe is
+        # trimmed automatically; the user can override via "Min avg daily volume".
+        _eff_minvol  = int(min_avg_vol) if min_avg_vol > 0 else _DEFAULT_NSE_MIN_VOL
+        _eff_minturn = float(min_turnover_cr) * 1e7
         with st.spinner("Downloading NSE bhavcopy to get all listed stocks..."):
-            tickers = fetch_all_nse_tickers(include_sme=False, min_volume=int(min_avg_vol))
-        st.info(f"📂 {len(tickers)} tradable NSE mainboard stocks loaded"
-                + (f" (bhavcopy volume ≥ {int(min_avg_vol):,})" if min_avg_vol > 0 else " (zero-volume excluded)")
-                + ". Large scan — may take several minutes.")
+            tickers = fetch_all_nse_tickers(include_sme=False, min_volume=_eff_minvol,
+                                            min_turnover=_eff_minturn)
+        _floor_note = "" if min_avg_vol > 0 else " · default floor, change it in the sidebar"
+        _turn_note  = f" · turnover ≥ ₹{min_turnover_cr:g} cr" if min_turnover_cr > 0 else ""
+        st.info(f"📂 {len(tickers)} tradable NSE mainboard stocks loaded "
+                f"(volume ≥ {_eff_minvol:,}{_floor_note}{_turn_note}). Large scan — may take several minutes.")
 
     elif mode == "All NSE + SME":
+        _eff_minvol  = int(min_avg_vol) if min_avg_vol > 0 else _DEFAULT_NSE_MIN_VOL
+        _eff_minturn = float(min_turnover_cr) * 1e7
         with st.spinner("Downloading NSE bhavcopy (mainboard + SME/Emerge)..."):
-            tickers = fetch_all_nse_tickers(include_sme=True, min_volume=int(min_avg_vol))
-        st.info(f"📂 {len(tickers)} tradable stocks loaded (mainboard + SME)"
-                + (f" (bhavcopy volume ≥ {int(min_avg_vol):,})" if min_avg_vol > 0 else " (zero-volume excluded)")
-                + ". Very large scan — may take 10–20+ minutes.")
+            tickers = fetch_all_nse_tickers(include_sme=True, min_volume=_eff_minvol,
+                                            min_turnover=_eff_minturn)
+        _floor_note = "" if min_avg_vol > 0 else " · default floor, change it in the sidebar"
+        _turn_note  = f" · turnover ≥ ₹{min_turnover_cr:g} cr" if min_turnover_cr > 0 else ""
+        st.info(f"📂 {len(tickers)} tradable stocks loaded (mainboard + SME) "
+                f"(volume ≥ {_eff_minvol:,}{_floor_note}{_turn_note}). Very large scan — may take 10–20+ minutes.")
 
     elif mode == "Custom Tickers":
         raw     = custom_input.replace(",", " ").replace("\n", " ").split()
@@ -872,10 +892,29 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
             _row["vs VWAP"]   = f"{_vp:+.1f}%" if _vp is not None else "—"
         _trows.append(_row)
 
-    st.dataframe(
+    _tbl_event = st.dataframe(
         pd.DataFrame(_trows).style.map(_style_signal, subset=["Signal"]),
         use_container_width=True, hide_index=True,
+        on_select="rerun", selection_mode="multi-row",
+        key=f"tblsel_{_lo}",
     )
+    # Add the selected rows straight from the table to the watchlist.
+    _sel_rows = _tbl_event.selection.rows if _tbl_event and _tbl_event.selection else []
+    _sel_addable = [_band_rs[i] for i in _sel_rows
+                    if not is_watched(_band_rs[i]["ticker"], interval)]
+    _bcol1, _bcol2 = st.columns([1, 3])
+    if _bcol1.button(
+        f"⭐ Add {len(_sel_addable)} selected to watchlist",
+        key=f"tbladd_{_lo}", disabled=not _sel_addable,
+        help="Tick rows in the table above, then click to add them.",
+    ):
+        for _r in _sel_addable:
+            add_to_watchlist(_r["ticker"], _r["price"], _r["signal"], _r["score"], interval)
+        st.session_state.pop("wl_eval_cache", None)
+        st.toast(f"Added {len(_sel_addable)} stock(s) to your watchlist", icon="⭐")
+        st.rerun()
+    if _sel_rows and not _sel_addable:
+        _bcol2.caption("All selected stocks are already in your watchlist.")
 
     # Per-stock detail + chart for this band
     for r in _band_rs:
