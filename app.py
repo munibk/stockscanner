@@ -185,6 +185,24 @@ with st.sidebar:
     top_n = st.number_input("Show top N BUY signals (0 = all)", min_value=0, value=0, step=1)
 
     st.divider()
+    st.markdown("**🔇 Volume filters**")
+    exclude_void = st.toggle(
+        "Skip low-volume (VOID) stocks", value=True,
+        help="Drop stocks whose current volume is below 0.7× their 20-bar average "
+             "(the volume veto) — these can't confirm any signal.",
+    )
+    require_vol_confirm = st.toggle(
+        "Only stocks with volume confirmation", value=False,
+        help="Keep only stocks where volume + OBV actively confirm the move "
+             "(high relative volume aligned with OBV direction).",
+    )
+    min_avg_vol = st.number_input(
+        "Min avg daily volume (shares, 0 = off)", min_value=0, value=0, step=1000,
+        help="Skip illiquid stocks whose 20-bar average volume is below this. "
+             "Useful for All-NSE / SME scans.",
+    )
+
+    st.divider()
     live_monitor = st.toggle("📗 Live Monitor (auto-refresh)", value=False)
     refresh_secs = 60
     if live_monitor:
@@ -439,7 +457,7 @@ _CACHE_TTL = {
     "1m":  15 * 60,   "5m":  30 * 60,  "15m": 60 * 60,
     "1h":  2  * 3600, "1d":  8  * 3600, "1wk": 24 * 3600,
 }
-_ck          = f"{mode}|{interval}"
+_ck          = f"{mode}|{interval}|v{int(exclude_void)}{int(require_vol_confirm)}{int(min_avg_vol)}"
 _ttl         = _CACHE_TTL.get(interval, 4 * 3600)
 _sc          = st.session_state.get("scan_cache", {})
 _cached      = _sc.get(_ck)
@@ -465,6 +483,7 @@ if _cache_fresh:
     results      = _cached["results"]
     errors       = _cached["errors"]
     newly_listed = _cached["newly_listed"]
+    skipped_lowvol = _cached.get("skipped_lowvol", 0)
     _age         = int(_time.time() - _cached["ts"])
     _mins, _secs = _age // 60, _age % 60
     st.info(
@@ -518,6 +537,7 @@ if not _cache_fresh:
     results      = []
     errors       = []
     newly_listed = []
+    skipped_lowvol = 0
 
     progress_bar  = st.progress(0, text="Starting scan...")
     live_status   = st.empty()
@@ -538,7 +558,26 @@ if not _cache_fresh:
             errors.append(ticker)
             continue
         df  = compute_indicators(df, interval)
+
+        # ── Liquidity filter: skip perpetually illiquid stocks ──
+        if min_avg_vol > 0:
+            _avg_vol = df["Vol_avg"].iloc[-1]
+            if pd.isna(_avg_vol) or _avg_vol < min_avg_vol:
+                skipped_lowvol += 1
+                continue
+
         sig = generate_signal(df, interval)
+
+        # ── Volume-signal filters ──
+        if exclude_void and sig["signal"] == "VOID":
+            skipped_lowvol += 1
+            continue
+        if require_vol_confirm and not any(
+            ("confirms buying" in _x or "confirms selling" in _x) for _x in sig["reasons"]
+        ):
+            skipped_lowvol += 1
+            continue
+
         sig["ticker"] = ticker
         sig["_df"]    = df
         results.append(sig)
@@ -591,6 +630,7 @@ if not _cache_fresh:
         "results":     results,
         "errors":      errors,
         "newly_listed": newly_listed,
+        "skipped_lowvol": skipped_lowvol,
     }
 
 # ── Warnings / errors ────────────────────────────────────────────────────────
@@ -601,8 +641,14 @@ for tkr, rows in newly_listed:
 if errors:
     st.error(f"Could not fetch data for: {', '.join(errors)}")
 
+if skipped_lowvol:
+    st.info(f"🔇 Skipped {skipped_lowvol} stock(s) that failed the volume filters (low/illiquid volume or no volume confirmation).")
+
 if not results:
-    st.error("No data could be fetched. Check your internet connection.")
+    if skipped_lowvol:
+        st.warning("No stocks passed the volume filters. Loosen them in the sidebar (e.g. turn off 'Only stocks with volume confirmation' or lower the min avg volume).")
+    else:
+        st.error("No data could be fetched. Check your internet connection.")
     st.stop()
 
 # ── Sort ──────────────────────────────────────────────────────────────────────
