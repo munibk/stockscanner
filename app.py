@@ -7,7 +7,6 @@ Then open http://localhost:8501 in your browser.
 """
 
 import importlib
-import json
 import sys
 import os
 from datetime import datetime, date, timedelta
@@ -41,19 +40,6 @@ from stockupdate import (
     _NewlyListedError,
     MIN_ROWS,
 )
-
-import watchlist as _wl
-importlib.reload(_wl)
-from watchlist import (
-    load_watchlist,
-    add_to_watchlist,
-    remove_from_watchlist,
-    save_watchlist,
-    is_watched,
-)
-
-import scan_state as _scan_state
-importlib.reload(_scan_state)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -115,7 +101,7 @@ with st.sidebar:
         "All NSE Stocks",
         "All NSE + SME",
         "Custom Tickers",
-    ] + (["Zerodha Portfolio"] if _kite_available else []) + ["⭐ My Watchlist"]
+    ] + (["Zerodha Portfolio"] if _kite_available else [])
     mode = st.radio("Stock List", _mode_options, index=0)
 
     # ── Zerodha: show login link + request_token input ──
@@ -188,29 +174,6 @@ with st.sidebar:
     top_n = st.number_input("Show top N BUY signals (0 = all)", min_value=0, value=0, step=1)
 
     st.divider()
-    st.markdown("**🔇 Volume filters** (all off by default — every stock is scanned)")
-    exclude_void = st.toggle(
-        "Skip low-volume (VOID) stocks", value=False,
-        help="Drop stocks whose current volume is below 0.7× their 20-bar average "
-             "(the volume veto) — these can't confirm any signal.",
-    )
-    require_vol_confirm = st.toggle(
-        "Only stocks with volume confirmation", value=False,
-        help="Keep only stocks where volume + OBV actively confirm the move "
-             "(high relative volume aligned with OBV direction).",
-    )
-    min_avg_vol = st.number_input(
-        "Min avg daily volume (shares, 0 = off)", min_value=0, value=0, step=1000,
-        help="Skip stocks whose own 20-bar average volume is below this during "
-             "the scan. 0 = scan every stock regardless of volume.",
-    )
-    min_turnover_cr = st.number_input(
-        "Min avg daily turnover (₹ crore, 0 = off)", min_value=0.0, value=0.0, step=0.5,
-        help="Skip stocks whose own average daily turnover (avg volume × price) is "
-             "below this during the scan. 0 = scan every stock regardless of turnover.",
-    )
-
-    st.divider()
     live_monitor = st.toggle("📗 Live Monitor (auto-refresh)", value=False)
     refresh_secs = 60
     if live_monitor:
@@ -239,270 +202,7 @@ with st.sidebar:
     st.divider()
     st.caption("ℹ️ Zerodha Portfolio: add api_key & api_secret to Streamlit Secrets, then log in from the sidebar.")
 # ── Auto-run when live monitor is active ────────────────────────────────────────
-# Keep the genuine button press distinct from the live-monitor auto-refresh so the
-# resumable-scan logic can tell "user wants a fresh scan" from "keep the loop going".
-run_clicked = run
-live_auto   = live_monitor and st.session_state.get("live_active", False)
-run = run_clicked or live_auto
-
-
-# ── Signal cell styler (shared by watchlist, live table, final table) ─────────
-def _style_signal(val):
-    v = str(val)
-    if v.startswith("BUY"):
-        return "background-color: #0d3b26; color: #00e676; font-weight: bold"
-    if v.startswith("SELL"):
-        return "background-color: #3b0d0d; color: #ff5252; font-weight: bold"
-    if v.startswith("VOID"):
-        return "background-color: #1a1a1a; color: #888888; font-weight: bold"
-    return "background-color: #3b3b0d; color: #ffd600"
-
-
-def _signal_display(r: dict) -> str:
-    """Human-readable signal that exposes *why* a strong score is a HOLD.
-
-    When the score-implied signal (BUY/SELL) was downgraded to HOLD by a
-    post-score filter, show it as e.g. ``HOLD (stale BUY 72)`` or
-    ``HOLD (HTF BUY 72)`` so the reason is obvious at a glance in the table.
-    """
-    sig = r.get("signal", "")
-    if sig != "HOLD":
-        return sig
-    base = r.get("base_signal")
-    if base not in ("BUY", "SELL"):
-        return sig
-    dg = r.get("downgrade")
-    reason = {"stale": "stale", "htf": "HTF"}.get(dg)
-    if not reason:
-        return sig
-    return f"HOLD ({reason} {base} {r.get('score', 0):.0f})"
-
-
-def _ensure_df(r: dict, interval: str):
-    """Return the candle frame for a result, re-fetching it if it was dropped.
-
-    Candle frames are not persisted in the on-disk scan checkpoint (to keep it
-    small), so a scan resumed after a real disconnect has ``_df is None`` for the
-    stocks processed before the interruption. Re-fetch on demand when a chart or
-    comparison actually needs it.
-    """
-    df = r.get("_df")
-    if df is not None:
-        return df
-    try:
-        df = fetch_data(r["ticker"], interval)
-        if df is not None:
-            df = compute_indicators(df, interval)
-            r["_df"] = df
-        return df
-    except Exception:
-        return None
-
-
-# ── Watchlist page (short-circuits the scanner flow) ─────────────────────────
-def _signal_badge_html(sig: str) -> str:
-    css = {
-        "BUY":  "background:#0d3b26;color:#00e676",
-        "SELL": "background:#3b0d0d;color:#ff5252",
-        "HOLD": "background:#3b3b0d;color:#ffd600",
-        "VOID": "background:#1a1a1a;color:#888888",
-    }.get(sig, "background:#3b3b0d;color:#ffd600")
-    return f'<span style="{css};padding:2px 8px;border-radius:6px;font-weight:bold">{sig}</span>'
-
-
-def _evaluate_watchlist(items: list[dict]) -> list[dict]:
-    """Re-fetch live data for each entry and compute current signal + change%."""
-    rows = []
-    prog = st.progress(0.0, text="Refreshing watchlist...")
-    for i, it in enumerate(items):
-        tkr, ivl = it["ticker"], it.get("interval", "1d")
-        prog.progress((i + 1) / len(items), text=f"Updating {tkr} ({ivl})...")
-        row = dict(it)
-        try:
-            df = fetch_data(tkr, ivl)
-            if df is None or len(df) < MIN_ROWS:
-                raise ValueError("no data")
-            df = compute_indicators(df, ivl)
-            sig = generate_signal(df, ivl)
-            cur_price = sig["price"]
-            row.update({
-                "current_price":  cur_price,
-                "current_signal": sig["signal"],
-                "current_score":  sig["score"],
-                "change_pct":     (cur_price - it["added_price"]) / it["added_price"] * 100
-                                  if it.get("added_price") else 0.0,
-                "rsi":            sig["rsi"],
-                "target":         sig.get("target1"),
-                "stop":           sig.get("stop_loss"),
-                "regime":         sig.get("regime", "—"),
-                "summary":        sig.get("summary", ""),
-                "ok":             True,
-            })
-        except Exception:
-            row.update({"ok": False, "current_signal": "—", "current_price": None,
-                        "current_score": None, "change_pct": None})
-        rows.append(row)
-    prog.empty()
-    return rows
-
-
-if mode == "⭐ My Watchlist":
-    st.title("⭐ My Watchlist")
-    st.caption(
-        "Stocks you're tracking, with the snapshot from when you added them vs. the "
-        "live signal now. Add stocks here, or from the **Add to Watchlist** button on "
-        "any scan result."
-    )
-
-    # ── Add a stock manually ─────────────────────────────────────────────────
-    with st.form("wl_add_form", clear_on_submit=True):
-        _c1, _c2 = st.columns([3, 1])
-        _new_tkr = _c1.text_input("Add ticker (NSE symbol)", placeholder="RELIANCE")
-        _submit = _c2.form_submit_button("➕ Add", width="stretch", type="primary")
-        if _submit and _new_tkr.strip():
-            _t = _new_tkr.upper().strip()
-            with st.spinner(f"Fetching {_t} ({interval})..."):
-                try:
-                    _df = fetch_data(_t, interval)
-                    if _df is None or len(_df) < MIN_ROWS:
-                        st.error(f"Could not fetch enough data for {_t}.")
-                    else:
-                        _df = compute_indicators(_df, interval)
-                        _sig = generate_signal(_df, interval)
-                        _added, _msg = add_to_watchlist(
-                            _t, _sig["price"], _sig["signal"], _sig["score"], interval
-                        )
-                        (st.success if _added else st.warning)(_msg)
-                        st.rerun()
-                except Exception as _e:
-                    st.error(f"Failed to add {_t}: {_e}")
-
-    _items = load_watchlist()
-    if not _items:
-        st.info("Your watchlist is empty. Add a ticker above, or use **Add to Watchlist** on a scan result.")
-        st.stop()
-
-    _wc1, _wc2, _wc3 = st.columns([1, 1, 2])
-    _do_refresh = _wc1.button("🔄 Refresh prices", type="primary")
-    if _wc2.button("🗑️ Clear all"):
-        save_watchlist([])
-        st.rerun()
-
-    # Evaluate (cache in session so removing a row doesn't re-fetch everything)
-    _wl_cache_key = "wl_eval_cache"
-    _items_sig = [(it["ticker"], it.get("interval"), it.get("added_at")) for it in _items]
-    _cache = st.session_state.get(_wl_cache_key)
-    if _do_refresh or _cache is None or _cache.get("sig") != _items_sig:
-        _evaluated = _evaluate_watchlist(_items)
-        st.session_state[_wl_cache_key] = {"sig": _items_sig, "rows": _evaluated}
-    else:
-        _evaluated = _cache["rows"]
-
-    # ── Summary table ────────────────────────────────────────────────────────
-    _flipped = 0
-    _table = []
-    for r in _evaluated:
-        _chg = r.get("change_pct")
-        _changed = r.get("ok") and r.get("current_signal") != r.get("added_signal")
-        if _changed:
-            _flipped += 1
-        _table.append({
-            "Ticker":         r["ticker"],
-            "TF":             r.get("interval", "1d"),
-            "Added On":       r.get("added_at", "—"),
-            "Added Price":    f"₹{r['added_price']:,.2f}" if r.get("added_price") else "—",
-            "Added Signal":   r.get("added_signal", "—"),
-            "Current Price":  f"₹{r['current_price']:,.2f}" if r.get("current_price") else "—",
-            "Current Signal": r.get("current_signal", "—"),
-            "Score":          f"{r['current_score']:.0f}" if r.get("current_score") is not None else "—",
-            "Change %":       round(_chg, 2) if _chg is not None else None,
-            "Signal Changed": "⚠️ yes" if _changed else "",
-            "Target":         f"₹{r['target']:,.2f}" if r.get("target") else "—",
-            "Stop":           f"₹{r['stop']:,.2f}" if r.get("stop") else "—",
-        })
-
-    if _flipped:
-        st.warning(f"⚠️ {_flipped} stock(s) have a different signal now than when you added them — review below.")
-
-    def _style_change(v):
-        if v is None:
-            return ""
-        return "color:#00e676;font-weight:bold" if v >= 0 else "color:#ff5252;font-weight:bold"
-
-    _wl_df = pd.DataFrame(_table)
-    st.dataframe(
-        _wl_df.style
-            .map(_style_signal, subset=["Added Signal", "Current Signal"])
-            .map(_style_change, subset=["Change %"])
-            .format({"Change %": "{:+.2f}%"}, na_rep="—"),
-        use_container_width=True, hide_index=True,
-    )
-
-    # ── Per-stock cards with remove button + plain-English signal ─────────────
-    st.markdown("### Details")
-    for r in _evaluated:
-        _icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡", "VOID": "⚫"}.get(r.get("current_signal"), "⚪")
-        _chg = r.get("change_pct")
-        _chg_str = f"{_chg:+.2f}%" if _chg is not None else "n/a"
-        with st.expander(f"{_icon}  {r['ticker']} ({r.get('interval','1d')})  —  now {r.get('current_signal','—')}  |  {_chg_str} since added"):
-            _lc, _rc = st.columns([2, 3])
-            with _lc:
-                st.markdown(f"**Added:** {r.get('added_at','—')}")
-                st.markdown(
-                    f"**Added signal:** {_signal_badge_html(r.get('added_signal','—'))} "
-                    f"at ₹{r.get('added_price', 0):,.2f}",
-                    unsafe_allow_html=True,
-                )
-                if r.get("ok"):
-                    st.markdown(
-                        f"**Current signal:** {_signal_badge_html(r.get('current_signal','—'))} "
-                        f"(score {r.get('current_score', 0):.0f}) at ₹{r.get('current_price', 0):,.2f}",
-                        unsafe_allow_html=True,
-                    )
-                    _cc = "green" if (_chg or 0) >= 0 else "red"
-                    st.markdown(f"**Change since added:** :{_cc}[{_chg_str}]")
-                    st.markdown(f"**RSI:** {r.get('rsi','—')}  |  **Regime:** {str(r.get('regime','—')).title()}")
-                    if r.get("target") and r.get("stop"):
-                        st.markdown(f"🎯 **Target:** ₹{r['target']:,.2f}  🛑 **Stop:** ₹{r['stop']:,.2f}")
-                else:
-                    st.error("Could not fetch live data for this stock right now.")
-                if st.button("🗑️ Remove", key=f"wl_rm_{r['ticker']}_{r.get('interval','1d')}"):
-                    remove_from_watchlist(r["ticker"], r.get("interval", "1d"))
-                    st.session_state.pop(_wl_cache_key, None)
-                    st.rerun()
-            with _rc:
-                if r.get("ok") and r.get("summary"):
-                    st.info(f"💬 {r['summary']}")
-
-    # ── Export / import for permanent storage ────────────────────────────────
-    st.divider()
-    _ec1, _ec2 = st.columns(2)
-    _ec1.download_button(
-        "⬇️ Export watchlist (JSON)",
-        data=json.dumps(_items, indent=2),
-        file_name="watchlist.json",
-        mime="application/json",
-    )
-    _up = _ec2.file_uploader("⬆️ Import watchlist (JSON)", type=["json"])
-    if _up is not None:
-        try:
-            _imported = json.loads(_up.getvalue().decode("utf-8"))
-            if isinstance(_imported, list):
-                save_watchlist(_imported)
-                st.session_state.pop(_wl_cache_key, None)
-                st.success(f"Imported {len(_imported)} watchlist entries.")
-                st.rerun()
-            else:
-                st.error("Invalid watchlist file format.")
-        except Exception as _e:
-            st.error(f"Could not import: {_e}")
-
-    st.caption(
-        "ℹ️ On Streamlit Cloud the watchlist file resets on redeploy/reboot — "
-        "use **Export** to keep a permanent copy and **Import** to restore it."
-    )
-    st.stop()
-
+run = run or (live_monitor and st.session_state.get("live_active", False))
 
 # ── Scan result cache (session-state backed, TTL per interval) ────────────────
 import time as _time
@@ -511,7 +211,7 @@ _CACHE_TTL = {
     "1m":  15 * 60,   "5m":  30 * 60,  "15m": 60 * 60,
     "1h":  2  * 3600, "1d":  8  * 3600, "1wk": 24 * 3600,
 }
-_ck          = f"{mode}|{interval}|v{int(exclude_void)}{int(require_vol_confirm)}{int(min_avg_vol)}t{min_turnover_cr}"
+_ck          = f"{mode}|{interval}"
 _ttl         = _CACHE_TTL.get(interval, 4 * 3600)
 _sc          = st.session_state.get("scan_cache", {})
 _cached      = _sc.get(_ck)
@@ -521,28 +221,8 @@ _cache_fresh = (
     and (_time.time() - _cached["ts"]) < _ttl
 )
 
-# ── Resumable-scan control flags ─────────────────────────────────────────────
-# A long scan is processed in short time-boxed batches that persist progress to
-# disk (.scancache/) and drive themselves forward with st.rerun(). This keeps the
-# script alive in small slices, so a screen-lock / disconnect / refresh loses at
-# most one batch — on reconnect we pick the interrupted scan up where it stopped
-# instead of starting over.
-_disk_cur            = _scan_state.load(_ck)
-_inprogress_current  = bool(_disk_cur and _disk_cur.get("status") == "running")
-
-# A genuine click (or a live-monitor tick with nothing already running) starts a
-# fresh scan; otherwise we continue / resume whatever was interrupted.
-_should_start = run_clicked or (live_auto and not _inprogress_current and not _cache_fresh)
-
-_resume = None
-if not _should_start and not _cache_fresh:
-    if _inprogress_current:
-        _resume = _disk_cur
-    else:
-        _resume = _scan_state.load_active()   # an interrupted scan from any ck
-
-# ── Welcome screen (only when there's nothing to show, run or resume) ─────────
-if not _should_start and not _cache_fresh and _resume is None:
+# ── Welcome screen (skipped when cached data can be shown) ───────────────────
+if not run and not _cache_fresh:
     st.title("📈 Nifty Stock Signal Scanner")
     st.markdown("Configure options in the **sidebar** and click **Run Scan** to start.")
     st.divider()
@@ -552,12 +232,21 @@ if not _should_start and not _cache_fresh and _resume is None:
     col3.info("**Charts**\n\nInteractive candlestick with EMA20, EMA50, SMA200, Volume & RSI")
     st.stop()
 
+# ── Signal cell styler (shared by live table, final table, and cache path) ────
+def _style_signal(val):
+    if val == "BUY":
+        return "background-color: #0d3b26; color: #00e676; font-weight: bold"
+    if val == "SELL":
+        return "background-color: #3b0d0d; color: #ff5252; font-weight: bold"
+    if val == "VOID":
+        return "background-color: #1a1a1a; color: #888888; font-weight: bold"
+    return "background-color: #3b3b0d; color: #ffd600"
+
 # ── Fast path: load results from session-state cache ─────────────────────────
-if _cache_fresh and not _should_start and _resume is None:
+if _cache_fresh:
     results      = _cached["results"]
     errors       = _cached["errors"]
     newly_listed = _cached["newly_listed"]
-    skipped_lowvol = _cached.get("skipped_lowvol", 0)
     _age         = int(_time.time() - _cached["ts"])
     _mins, _secs = _age // 60, _age % 60
     st.info(
@@ -565,113 +254,88 @@ if _cache_fresh and not _should_start and _resume is None:
         f"click **Run Scan** to fetch fresh data."
     )
 
-# ── Active scan: start fresh OR resume an interrupted one ─────────────────────
-_scanning = _should_start or (_resume is not None)
-if _scanning:
-    if _should_start:
-        # ---- Resolve the ticker universe for the current sidebar selection ----
-        if mode == "Nifty 50":
-            with st.spinner("Fetching Nifty 50 constituents from NSE..."):
-                tickers = fetch_nifty50_tickers()
+# ── Resolve tickers + scan (skipped on cache hit) ────────────────────────────
+if not _cache_fresh:
+    if mode == "Nifty 50":
+        with st.spinner("Fetching Nifty 50 constituents from NSE..."):
+            tickers = fetch_nifty50_tickers()
 
-        elif mode == "Intraday Picks (top 30)":
-            tickers = list(NIFTY_INTRADAY_STOCKS)
+    elif mode == "Intraday Picks (top 30)":
+        tickers = list(NIFTY_INTRADAY_STOCKS)
 
-        elif mode == "All NSE Stocks":
-            with st.spinner("Downloading NSE bhavcopy to get all listed stocks..."):
-                tickers = fetch_all_nse_tickers(include_sme=False)
-            st.info(f"📂 {len(tickers)} NSE mainboard stocks loaded — scanning all. "
-                    f"Large scan — may take several minutes.")
+    elif mode == "All NSE Stocks":
+        with st.spinner("Downloading NSE bhavcopy to get all listed stocks..."):
+            tickers = fetch_all_nse_tickers(include_sme=False)
+        st.info(f"📂 {len(tickers)} NSE mainboard stocks loaded. Large scan — may take several minutes.")
 
-        elif mode == "All NSE + SME":
-            with st.spinner("Downloading NSE bhavcopy (mainboard + SME/Emerge)..."):
-                tickers = fetch_all_nse_tickers(include_sme=True)
-            st.info(f"📂 {len(tickers)} stocks loaded (mainboard + SME) — scanning all. "
-                    f"Very large scan — may take 10–20+ minutes.")
+    elif mode == "All NSE + SME":
+        with st.spinner("Downloading NSE bhavcopy (mainboard + SME/Emerge)..."):
+            tickers = fetch_all_nse_tickers(include_sme=True)
+        st.info(f"📂 {len(tickers)} stocks loaded (mainboard + SME). Very large scan — may take 10–20+ minutes.")
 
-        elif mode == "Custom Tickers":
-            raw     = custom_input.replace(",", " ").replace("\n", " ").split()
-            tickers = [t.upper().strip() for t in raw if t.strip()]
-            if not tickers:
-                st.error("Enter at least one ticker in the sidebar.")
-                st.stop()
+    elif mode == "Custom Tickers":
+        raw     = custom_input.replace(",", " ").replace("\n", " ").split()
+        tickers = [t.upper().strip() for t in raw if t.strip()]
+        if not tickers:
+            st.error("Enter at least one ticker in the sidebar.")
+            st.stop()
 
-        else:  # Zerodha Portfolio
-            if "kite_access_token" not in st.session_state:
-                st.warning("Please log in to Zerodha using the sidebar first.")
-                st.stop()
-            try:
-                tickers = fetch_zerodha_holdings_with_token(
-                    st.session_state["kite_api_key"],
-                    st.session_state["kite_access_token"],
-                )
-            except Exception as e:
-                st.error(f"Failed to fetch Zerodha holdings: {e}")
-                st.stop()
-            if not tickers:
-                st.warning("No holdings or open positions found in your Zerodha account.")
-                st.stop()
-
-        _active_ck = _ck
-        _state = {
-            "ck": _ck, "mode": mode, "interval": interval,
-            "tickers": tickers, "index": 0,
-            "results": [], "errors": [], "newly_listed": [], "skipped_lowvol": 0,
-            "status": "running", "started": _time.time(), "updated": _time.time(),
-        }
-        st.session_state.setdefault("scan_mem", {})[_active_ck] = {}
-        _scan_state.save(_state)
-    else:
-        # ---- Resume an interrupted scan (its saved context wins over sidebar) ----
-        _state     = _resume
-        _active_ck = _state["ck"]
-        mode       = _state.get("mode", mode)
-        interval   = _state.get("interval", interval)
-        tickers    = _state["tickers"]
-        if _active_ck != _ck:
-            st.info(
-                f"♻️ Resuming an interrupted **{mode} · {interval}** scan that was "
-                f"stopped (e.g. screen-lock) — {_state['index']}/{len(tickers)} done. "
-                f"Use the sidebar selection above to start a different scan instead."
+    else:  # Zerodha Portfolio
+        if "kite_access_token" not in st.session_state:
+            st.warning("Please log in to Zerodha using the sidebar first.")
+            st.stop()
+        try:
+            tickers = fetch_zerodha_holdings_with_token(
+                st.session_state["kite_api_key"],
+                st.session_state["kite_access_token"],
             )
+        except Exception as e:
+            st.error(f"Failed to fetch Zerodha holdings: {e}")
+            st.stop()
+        if not tickers:
+            st.warning("No holdings or open positions found in your Zerodha account.")
+            st.stop()
 
-    _mem = st.session_state.setdefault("scan_mem", {}).setdefault(_active_ck, {})
+    # ── Scan ──────────────────────────────────────────────────────────────────
+    results      = []
+    errors       = []
+    newly_listed = []
 
-    results        = _state["results"]
-    errors         = _state["errors"]
-    newly_listed   = _state["newly_listed"]
-    skipped_lowvol = _state["skipped_lowvol"]
-    _index         = _state["index"]
-    _total         = len(tickers)
-    # Re-attach any candle frames still in memory (lost after a real disconnect —
-    # those are re-fetched lazily when a chart is opened).
-    for _r in results:
-        _r["_df"] = _mem.get(_r["ticker"])
-
-    progress_bar  = st.progress(_index / _total if _total else 0.0, text="Starting scan...")
+    progress_bar  = st.progress(0, text="Starting scan...")
     live_status   = st.empty()
     live_table_ph = st.empty()
 
-    if st.button("⏹ Cancel scan", key="cancel_scan"):
-        _scan_state.clear(_active_ck)
-        st.session_state.get("scan_mem", {}).pop(_active_ck, None)
-        st.session_state.pop("live_active", None)
-        st.warning("Scan cancelled.")
-        st.stop()
+    # refresh the live table ~20 times across the full list
+    _UPDATE_EVERY = max(1, min(10, max(1, len(tickers) // 20)))
 
-    # ── Render the results gathered so far, so the table stays visible for the
-    #    whole batch (not just a flash before the next rerun) ───────────────────
-    def _render_live():
-        _b = sum(1 for _r in results if _r["signal"] == "BUY")
-        _s = sum(1 for _r in results if _r["signal"] == "SELL")
-        _h = sum(1 for _r in results if _r["signal"] == "HOLD")
-        _skipped = len(newly_listed) + len(errors)
-        live_status.markdown(
-            f"**Scanned {_index} / {_total}** "
-            f"&nbsp;|&nbsp; BUY **{_b}** &nbsp; HOLD **{_h}** &nbsp; SELL **{_s}**"
-            + (f" &nbsp;|&nbsp; Skipped {_skipped}" if _skipped else "")
-        )
-        if results:
+    for i, ticker in enumerate(tickers):
+        pct = (i + 1) / len(tickers)
+        progress_bar.progress(pct, text=f"Scanning {ticker}  ({i+1}/{len(tickers)})")
+        try:
+            df = fetch_data(ticker, interval)
+        except _NewlyListedError as e:
+            newly_listed.append((e.ticker, e.rows))
+            continue
+        if df is None:
+            errors.append(ticker)
+            continue
+        df  = compute_indicators(df, interval)
+        sig = generate_signal(df, interval)
+        sig["ticker"] = ticker
+        sig["_df"]    = df
+        results.append(sig)
+
+        # live table update every _UPDATE_EVERY stocks (and always on the last one)
+        if results and (len(results) % _UPDATE_EVERY == 0 or i == len(tickers) - 1):
+            _b = sum(1 for _r in results if _r["signal"] == "BUY")
+            _s = sum(1 for _r in results if _r["signal"] == "SELL")
+            _h = sum(1 for _r in results if _r["signal"] == "HOLD")
+            _skipped = len(newly_listed) + len(errors)
+            live_status.markdown(
+                f"**Scanned {i+1} / {len(tickers)}** "
+                f"&nbsp;|&nbsp; BUY **{_b}** &nbsp; HOLD **{_h}** &nbsp; SELL **{_s}**"
+                + (f" &nbsp;|&nbsp; Skipped {_skipped}" if _skipped else "")
+            )
             _partial = sorted(
                 results,
                 key=lambda x: ({"BUY": 0, "HOLD": 1, "SELL": 2, "VOID": 3}.get(x["signal"], 4), -x["score"])
@@ -680,7 +344,7 @@ if _scanning:
                 {
                     "Ticker":    _r["ticker"],
                     "Price":     f"\u20b9{_r['price']:,.2f}",
-                    "Signal":    _signal_display(_r),
+                    "Signal":    _r["signal"],
                     "Score":     _r["score"],
                     "RSI":       _r["rsi"],
                     "Vol":       f"{_r['vol_ratio']}x",
@@ -690,91 +354,26 @@ if _scanning:
                 for _r in _partial
             ]
             with live_table_ph.container():
-                st.caption(f"Live results — top 20 of {len(results)} scanned (auto-saving progress)")
+                st.caption(
+                    f"Live results — top 20 of {len(results)} scanned "
+                    f"(refreshes every {_UPDATE_EVERY} stocks)"
+                )
                 st.dataframe(
                     pd.DataFrame(_live_rows).style.map(_style_signal, subset=["Signal"]),
                     use_container_width=True, hide_index=True,
                 )
 
-    _render_live()
-
-    # ── Process ONE time-boxed batch, persist, then rerun to keep going ────────
-    _BATCH_SECONDS = 4.0
-    _t0 = _time.time()
-    while _index < _total and (_time.time() - _t0) < _BATCH_SECONDS:
-        ticker = tickers[_index]
-        _index += 1
-        progress_bar.progress(_index / _total, text=f"Scanning {ticker}  ({_index}/{_total})")
-        try:
-            df = fetch_data(ticker, interval)
-        except _NewlyListedError as e:
-            newly_listed.append((e.ticker, e.rows))
-            continue
-        if df is None:
-            errors.append(ticker)
-            continue
-        df = compute_indicators(df, interval)
-
-        # ── Optional liquidity filters (off by default → scan everything) ──
-        if min_avg_vol > 0 or min_turnover_cr > 0:
-            _avg_vol = df["Vol_avg"].iloc[-1]
-            if min_avg_vol > 0 and (pd.isna(_avg_vol) or _avg_vol < min_avg_vol):
-                skipped_lowvol += 1
-                continue
-            if min_turnover_cr > 0:
-                _avg_turnover = (0 if pd.isna(_avg_vol) else _avg_vol) * float(df["Close"].iloc[-1])
-                if _avg_turnover < float(min_turnover_cr) * 1e7:
-                    skipped_lowvol += 1
-                    continue
-
-        sig = generate_signal(df, interval)
-
-        # ── Volume-signal filters ──
-        if exclude_void and sig["signal"] == "VOID":
-            skipped_lowvol += 1
-            continue
-        if require_vol_confirm and not any(
-            ("confirms buying" in _x or "confirms selling" in _x) for _x in sig["reasons"]
-        ):
-            skipped_lowvol += 1
-            continue
-
-        sig["ticker"] = ticker
-        sig["_df"]    = df
-        _mem[ticker]  = df
-        results.append(sig)
-
-    # ── Persist this batch's progress to disk ─────────────────────────────────
-    _done = _index >= _total
-    _state.update({
-        "index": _index, "results": results, "errors": errors,
-        "newly_listed": newly_listed, "skipped_lowvol": skipped_lowvol,
-        "mode": mode, "interval": interval,
-        "status": "done" if _done else "running",
-    })
-    _scan_state.save(_state)
-
-    # Refresh the table with this batch's freshly-scanned stocks before rerun.
-    _render_live()
-
-    if not _done:
-        # Yield briefly so the UI flushes, then drive the next batch.
-        _time.sleep(0.05)
-        st.rerun()
-
-    # ── Scan complete: promote to session cache, clean up, render below ────────
     progress_bar.empty()
     live_status.empty()
-    live_table_ph.empty()
-    st.session_state.setdefault("scan_cache", {})[_active_ck] = {
+    live_table_ph.empty()   # full results section renders below
+
+    # ── Save scan results to session-state cache ───────────────────────────────
+    st.session_state.setdefault("scan_cache", {})[_ck] = {
         "ts":          _time.time(),
         "results":     results,
         "errors":      errors,
         "newly_listed": newly_listed,
-        "skipped_lowvol": skipped_lowvol,
     }
-    _scan_state.clear(_active_ck)
-    st.session_state.get("scan_mem", {}).pop(_active_ck, None)
 
 # ── Warnings / errors ────────────────────────────────────────────────────────
 for tkr, rows in newly_listed:
@@ -784,14 +383,8 @@ for tkr, rows in newly_listed:
 if errors:
     st.error(f"Could not fetch data for: {', '.join(errors)}")
 
-if skipped_lowvol:
-    st.info(f"🔇 Skipped {skipped_lowvol} stock(s) that failed the volume filters (low/illiquid volume or no volume confirmation).")
-
 if not results:
-    if skipped_lowvol:
-        st.warning("No stocks passed the volume filters. Loosen them in the sidebar (e.g. turn off 'Only stocks with volume confirmation' or lower the min avg volume).")
-    else:
-        st.error("No data could be fetched. Check your internet connection.")
+    st.error("No data could be fetched. Check your internet connection.")
     st.stop()
 
 # ── Sort ──────────────────────────────────────────────────────────────────────
@@ -868,47 +461,6 @@ m3.metric("🟡 HOLD", holds)
 m4.metric("🔴 SELL", sells)
 m5.metric("⚫ VOID",  voids)
 
-# ── Bulk "Add to Watchlist" (works for every scanned stock, all modes) ────────
-with st.expander("⭐ Add scanned stocks to your watchlist", expanded=False):
-    _res_by_tkr = {r["ticker"]: r for r in results}
-    _sig_filter = st.multiselect(
-        "Filter by signal (optional)",
-        ["BUY", "SELL", "HOLD", "VOID"],
-        default=[],
-        key="wl_bulk_sigfilter",
-    )
-    _options = [
-        r["ticker"] for r in results
-        if (not _sig_filter or r["signal"] in _sig_filter)
-        and not is_watched(r["ticker"], interval)
-    ]
-    st.caption(
-        f"{len(_options)} stock(s) available to add on the **{interval}** timeframe "
-        f"(already-watched stocks are hidden). Current signal, price & score are snapshotted."
-    )
-    _picked = st.multiselect("Select stocks to add", _options, key="wl_bulk_select")
-    _bc1, _bc2 = st.columns([1, 1])
-    if _bc1.button("⭐ Add selected", disabled=not _picked, type="primary"):
-        _n = 0
-        for _tk in _picked:
-            _r = _res_by_tkr.get(_tk)
-            if _r:
-                _ok, _ = add_to_watchlist(_tk, _r["price"], _r["signal"], _r["score"], interval)
-                _n += int(_ok)
-        st.session_state.pop("wl_eval_cache", None)
-        st.toast(f"Added {_n} stock(s) to your watchlist", icon="⭐")
-        st.rerun()
-    if _sig_filter and _bc2.button(f"⭐ Add ALL {len(_options)} filtered", disabled=not _options):
-        _n = 0
-        for _tk in _options:
-            _r = _res_by_tkr.get(_tk)
-            if _r:
-                _ok, _ = add_to_watchlist(_tk, _r["price"], _r["signal"], _r["score"], interval)
-                _n += int(_ok)
-        st.session_state.pop("wl_eval_cache", None)
-        st.toast(f"Added {_n} stock(s) to your watchlist", icon="⭐")
-        st.rerun()
-
 st.divider()
 
 # ── Price band grouping ───────────────────────────────────────────────────────
@@ -977,7 +529,7 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
         _row = {
             "Ticker":    r["ticker"],
             "Price (₹)": f"₹{r['price']:,.2f}",
-            "Signal":    _signal_display(r),
+            "Signal":    r["signal"],
             "Score":     r["score"],
             "RSI":       r["rsi"],
             "ADX":       r["adx"] if r["adx"] else None,
@@ -993,36 +545,17 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
             _row["vs VWAP"]   = f"{_vp:+.1f}%" if _vp is not None else "—"
         _trows.append(_row)
 
-    _tbl_event = st.dataframe(
+    st.dataframe(
         pd.DataFrame(_trows).style.map(_style_signal, subset=["Signal"]),
         use_container_width=True, hide_index=True,
-        on_select="rerun", selection_mode="multi-row",
-        key=f"tblsel_{_lo}",
     )
-    # Add the selected rows straight from the table to the watchlist.
-    _sel_rows = _tbl_event.selection.rows if _tbl_event and _tbl_event.selection else []
-    _sel_addable = [_band_rs[i] for i in _sel_rows
-                    if not is_watched(_band_rs[i]["ticker"], interval)]
-    _bcol1, _bcol2 = st.columns([1, 3])
-    if _bcol1.button(
-        f"⭐ Add {len(_sel_addable)} selected to watchlist",
-        key=f"tbladd_{_lo}", disabled=not _sel_addable,
-        help="Tick rows in the table above, then click to add them.",
-    ):
-        for _r in _sel_addable:
-            add_to_watchlist(_r["ticker"], _r["price"], _r["signal"], _r["score"], interval)
-        st.session_state.pop("wl_eval_cache", None)
-        st.toast(f"Added {len(_sel_addable)} stock(s) to your watchlist", icon="⭐")
-        st.rerun()
-    if _sel_rows and not _sel_addable:
-        _bcol2.caption("All selected stocks are already in your watchlist.")
 
     # Per-stock detail + chart for this band
     for r in _band_rs:
         if r["ticker"] not in _detail_tickers:
             continue
         sig_icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡", "VOID": "⚫"}.get(r["signal"], "🟡")
-        label    = f"{sig_icon}  **{r['ticker']}**  —  {_signal_display(r)}  ({r['score']:.0f}/100)  ₹{r['price']:,.2f}"
+        label    = f"{sig_icon}  **{r['ticker']}**  —  {r['signal']}  ({r['score']:.0f}/100)  ₹{r['price']:,.2f}"
 
         with st.expander(label, expanded=(len(results) == 1)):
             _tab_detail, _tab_chart = st.tabs(["📋 Details", "📈 Chart"])
@@ -1036,18 +569,8 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
                     "HOLD": "background:#3b3b0d;color:#ffd600;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
                     "VOID": "background:#1a1a1a;color:#888888;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
                 }.get(r["signal"], "background:#3b3b0d;color:#ffd600;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem")
-                st.markdown(f'<span style="{_badge_css}">{_signal_display(r)} &nbsp; {r["score"]:.0f}/100</span>', unsafe_allow_html=True)
+                st.markdown(f'<span style="{_badge_css}">{r["signal"]} &nbsp; {r["score"]:.0f}/100</span>', unsafe_allow_html=True)
                 st.markdown("")
-
-                if is_watched(r["ticker"], interval):
-                    st.caption(f"⭐ In your watchlist ({interval})")
-                elif st.button("⭐ Add to Watchlist", key=f"wl_add_{r['ticker']}_{interval}"):
-                    _added, _msg = add_to_watchlist(
-                        r["ticker"], r["price"], r["signal"], r["score"], interval
-                    )
-                    st.session_state.pop("wl_eval_cache", None)
-                    st.toast(_msg, icon="⭐" if _added else "ℹ️")
-                    st.rerun()
 
                 _d_left, _d_right = st.columns([2, 3])
 
@@ -1122,9 +645,7 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
 
                 # ── Prediction comparison panel (full width) ──────────────
                 if compare_date:
-                    _all_df   = _ensure_df(r, interval)
-                    if _all_df is None:
-                        _all_df = pd.DataFrame(index=pd.DatetimeIndex([]))
+                    _all_df   = r["_df"]
                     _hist_mask = _all_df.index.normalize() <= pd.Timestamp(compare_date)
                     _df_hist  = _all_df[_hist_mask]
                     _df_future = _all_df[~_hist_mask]
@@ -1180,16 +701,7 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
 
             # ── Chart tab (full width) ─────────────────────────────────────
             with _tab_chart:
-                _chart_df = r.get("_df")
-                if _chart_df is None:
-                    # Candle data was dropped (resumed-after-disconnect scan).
-                    # Re-fetch only when the user actually opens this chart.
-                    if st.button("📈 Load chart", key=f"loadchart_{r['ticker']}"):
-                        _chart_df = _ensure_df(r, interval)
-                if _chart_df is None:
-                    st.caption("Chart data not loaded — click **Load chart** to fetch it.")
-                    continue
-                df_c = _chart_df.tail(150).copy()
+                df_c = r["_df"].tail(150).copy()
 
                 fig = make_subplots(
                     rows=4, cols=1,

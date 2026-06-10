@@ -2,12 +2,6 @@
 zerodha.cfg
 .zerodha_token.json
 
-# User's personal watchlist (local to each machine)
-watchlist.json
-
-# In-progress / resumable scan checkpoints (local recovery state)
-.scancache/
-
 # Python cache
 __pycache__/
 *.py[cod]

@@ -39,21 +39,7 @@ import yfinance as yf
 from colorama import Fore, Style, init
 from tabulate import tabulate
 
-# Windows consoles default to cp1252 and crash on the ✓ / ⚠ / box-drawing glyphs
-# used in CLI output. Force UTF-8 (this only changes the encoding — it does NOT
-# wrap the stream, so it is safe to run on every import/reload).
-#
-# IMPORTANT: do NOT call colorama.init() here. init() replaces sys.stdout with a
-# delegating wrapper; under Streamlit (where stdout is already a captured stream
-# and this module is reloaded on every rerun) that wrapper recurses and raises
-# RecursionError on the next print(). colorama is therefore initialised lazily,
-# only when this file is run as a CLI (see main()). When imported as a library
-# the Fore/Style values are just inert ANSI strings, which is harmless.
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+init(autoreset=True)
 
 # ── Zerodha / Kite Connect integration ────────────────────────────────────────
 CONFIG_FILE  = os.path.join(os.path.dirname(__file__), "zerodha.cfg")
@@ -230,72 +216,53 @@ def fetch_nifty50_tickers() -> list[str]:
     return list(NIFTY_50_FALLBACK)
 
 
-# ── Bhavcopy download (used as a fallback source for the full NSE list) ───────
-_BHAV_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/124.0.0.0 Safari/537.36",
-    "Referer": "https://www.nseindia.com/",
-}
-
-
-def _get_bhavcopy(dt: date, timeout: int = 25) -> "pd.DataFrame | None":
-    """
-    Download and parse the NSE CM bhavcopy for `dt`. Fetched fresh on every
-    call (no disk cache). Returns None when that date has no bhavcopy
-    (weekend / holiday / not yet published).
-    """
-    import io
-    import zipfile
-
-    ds  = dt.strftime("%Y%m%d")
-    url = (f"https://nsearchives.nseindia.com/content/cm/"
-           f"BhavCopy_NSE_CM_0_0_0_{ds}_F_0000.csv.zip")
-    try:
-        resp = requests.get(url, headers=_BHAV_HEADERS, timeout=timeout)
-        if resp.status_code != 200:
-            return None
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-            raw = z.read(z.namelist()[0])
-        return pd.read_csv(io.BytesIO(raw), dtype=str)
-    except Exception:
-        return None
-
-
 def fetch_all_nse_tickers(include_sme: bool = True) -> list[str]:
     """
     Fetch every NSE-listed equity from the latest available daily bhavcopy.
     Mainboard stocks use the bare symbol (e.g. RELIANCE).
     SME/Emerge stocks get a -SM suffix (e.g. PRANIK-SM) when include_sme=True.
-
-    No volume / liquidity filtering is applied — the full tradable universe is
-    returned so every stock can be scanned. Falls back to the Nifty 50 list if
-    the bhavcopy download fails.
+    Falls back to the Nifty 50 fallback list if the download fails.
     """
+    import io
+    import zipfile
+
+    bhav_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://www.nseindia.com/",
+    }
+
     for days_back in range(10):          # try up to 10 calendar days back
         dt = date.today() - timedelta(days=days_back)
         if dt.weekday() >= 5:            # skip Saturday / Sunday
             continue
-        bhav = _get_bhavcopy(dt)
-        if bhav is None:
-            continue
+        ds  = dt.strftime("%Y%m%d")
+        url = (f"https://nsearchives.nseindia.com/content/cm/"
+               f"BhavCopy_NSE_CM_0_0_0_{ds}_F_0000.csv.zip")
         try:
+            resp = requests.get(url, headers=bhav_headers, timeout=25)
+            if resp.status_code != 200:
+                continue
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+                bhav = pd.read_csv(z.open(z.namelist()[0]), dtype=str)
+
             bhav["SctySrs"]  = bhav["SctySrs"].str.strip().str.upper()
             bhav["TckrSymb"] = bhav["TckrSymb"].str.strip().str.upper()
 
-            series = ["EQ", "SM"] if include_sme else ["EQ"]
-            if int(bhav["SctySrs"].isin(series).sum()) <= 100:
-                continue       # looks like a broken parse — try the previous day
-
-            tickers = bhav.loc[bhav["SctySrs"] == "EQ", "TckrSymb"].tolist()
+            tickers: list[str] = []
+            tickers.extend(bhav.loc[bhav["SctySrs"] == "EQ", "TckrSymb"].tolist())
             if include_sme:
-                tickers += [sym + "-SM" for sym in
-                            bhav.loc[bhav["SctySrs"] == "SM", "TckrSymb"].tolist()]
+                tickers.extend(
+                    sym + "-SM"
+                    for sym in bhav.loc[bhav["SctySrs"] == "SM", "TckrSymb"].tolist()
+                )
 
             tickers = sorted(set(tickers))
-            print(f"{Fore.CYAN}  ✓ Loaded {len(tickers)} NSE tickers "
-                  f"from bhavcopy ({dt}){Style.RESET_ALL}")
-            return tickers
+            if len(tickers) > 100:       # sanity check — expect 1800+ EQ + 600+ SM
+                print(f"{Fore.CYAN}  ✓ Loaded {len(tickers)} NSE tickers "
+                      f"from bhavcopy ({dt}){Style.RESET_ALL}")
+                return tickers
         except Exception as exc:
             print(f"{Fore.YELLOW}  ⚠ bhavcopy fetch failed "
                   f"({exc.__class__.__name__}), trying previous day{Style.RESET_ALL}")
@@ -457,6 +424,8 @@ def _fetch_nse_data(ticker: str) -> pd.DataFrame | None:
     Works for both mainboard (series EQ) and SME/Emerge (series SM) stocks.
     Downloads daily files in parallel — no Cloudflare issues (nsearchives subdomain).
     """
+    import io
+    import zipfile
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     # Parse ticker: "PRANIK-SM" → base="PRANIK", series="SM"
@@ -468,12 +437,24 @@ def _fetch_nse_data(ticker: str) -> pd.DataFrame | None:
         base_sym = ticker.upper()
         series   = "EQ"
 
+    bhav_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://www.nseindia.com/",
+    }
+
     def _fetch_one_day(dt: date):
-        """Read one date's bhavcopy (via the daily disk cache) → row_dict or None."""
-        df = _get_bhavcopy(dt, timeout=15)
-        if df is None:
-            return None
+        """Download bhavcopy for one date, return (date, row_dict) or None."""
+        ds  = dt.strftime("%Y%m%d")
+        url = (f"https://nsearchives.nseindia.com/content/cm/"
+               f"BhavCopy_NSE_CM_0_0_0_{ds}_F_0000.csv.zip")
         try:
+            r = requests.get(url, headers=bhav_headers, timeout=15)
+            if r.status_code != 200:
+                return None
+            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                df = pd.read_csv(z.open(z.namelist()[0]), dtype=str)
             row = df[
                 (df["TckrSymb"].str.strip().str.upper() == base_sym) &
                 (df["SctySrs"].str.strip().str.upper() == series)
@@ -912,8 +893,7 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
 
     def _make_result(signal, score, reasons, regime, stop_loss, target1, target2, rr,
                      bos_bull=False, bos_bear=False, rsi_bull_div=False, rsi_bear_div=False,
-                     htf_bullish=None, cooldown=False, vwap=None, vwap_pct=None,
-                     base_signal=None, downgrade=None):
+                     htf_bullish=None, cooldown=False, vwap=None, vwap_pct=None):
         sr          = _sr_result()
         proj_up     = proj_up_base
         proj_down   = proj_down_base
@@ -970,8 +950,6 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
             "rsi_bear_div":  rsi_bear_div,
             "htf_bullish":   htf_bullish,
             "cooldown":      cooldown,
-            "base_signal":   base_signal if base_signal is not None else signal,
-            "downgrade":     downgrade,
         }
 
     # ── Volume Veto ───────────────────────────────────────────────────────────
@@ -1175,11 +1153,6 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
     else:
         signal = "HOLD"
 
-    # Remember the score-implied signal so the UI can explain *why* a high/low
-    # score ended up as HOLD (e.g. "stale BUY" after a cooldown downgrade).
-    base_signal = signal
-    downgrade   = None
-
     # ── Signal Cooldown ───────────────────────────────────────────────────────
     cooldown = False
     cd_bars  = _COOLDOWN_BARS.get(interval, 5)
@@ -1198,18 +1171,15 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
                 cooldown = True
         if cooldown:
             signal = "HOLD"
-            downgrade = "stale"
             reasons.append(f"⚠ Signal cooldown — no fresh MACD crossover in last {cd_bars} bars (stale signal)")
 
     # ── Layer 2: HTF Filter ───────────────────────────────────────────────────
     if htf_bullish is not None:
         if signal == "BUY" and not htf_bullish:
             signal = "HOLD"
-            downgrade = "htf"
             reasons.append("⚠ HTF daily trend is bearish — LTF BUY downgraded to HOLD")
         elif signal == "SELL" and htf_bullish:
             signal = "HOLD"
-            downgrade = "htf"
             reasons.append("⚠ HTF daily trend is bullish — LTF SELL downgraded to HOLD")
 
     # ── Layer 4: assign stop/target based on direction ────────────────────────
@@ -1224,7 +1194,6 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
         bos_bull=bos_bull, bos_bear=bos_bear,
         rsi_bull_div=rsi_bull_div, rsi_bear_div=rsi_bear_div,
         htf_bullish=htf_bullish, cooldown=cooldown,
-        base_signal=base_signal, downgrade=downgrade,
         vwap=vwap, vwap_pct=vwap_pct,
     )
 
@@ -1586,10 +1555,6 @@ def scan(tickers: list[str], interval: str, top: int | None) -> None:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main():
-    # Initialise colorama only for real CLI usage. It wraps sys.stdout, which is
-    # unsafe to do at import time under Streamlit (see the note near the top).
-    init(autoreset=True)
-
     parser = argparse.ArgumentParser(
         description="Nifty 50 Buy/Sell Signal Generator"
     )
