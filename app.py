@@ -40,8 +40,6 @@ from stockupdate import (
     NIFTY_INTRADAY_STOCKS,
     _NewlyListedError,
     MIN_ROWS,
-    bhavcopy_cache_info,
-    clear_bhavcopy_cache,
 )
 
 import watchlist as _wl
@@ -56,10 +54,6 @@ from watchlist import (
 
 import scan_state as _scan_state
 importlib.reload(_scan_state)
-
-# Default liquidity floor applied to All-NSE / All-NSE+SME scans when the user
-# hasn't set their own "Min avg daily volume" (keeps the huge universe tradable).
-_DEFAULT_NSE_MIN_VOL = 50_000
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -194,9 +188,9 @@ with st.sidebar:
     top_n = st.number_input("Show top N BUY signals (0 = all)", min_value=0, value=0, step=1)
 
     st.divider()
-    st.markdown("**🔇 Volume filters**")
+    st.markdown("**🔇 Volume filters** (all off by default — every stock is scanned)")
     exclude_void = st.toggle(
-        "Skip low-volume (VOID) stocks", value=True,
+        "Skip low-volume (VOID) stocks", value=False,
         help="Drop stocks whose current volume is below 0.7× their 20-bar average "
              "(the volume veto) — these can't confirm any signal.",
     )
@@ -207,31 +201,14 @@ with st.sidebar:
     )
     min_avg_vol = st.number_input(
         "Min avg daily volume (shares, 0 = off)", min_value=0, value=0, step=1000,
-        help="Skip illiquid stocks whose 20-bar average volume is below this. "
-             "For All-NSE / SME scans this ALSO pre-filters the bhavcopy by that "
-             "day's traded volume, so illiquid names are dropped before fetching "
-             "(much faster). Zero-volume stocks are always excluded.",
+        help="Skip stocks whose own 20-bar average volume is below this during "
+             "the scan. 0 = scan every stock regardless of volume.",
     )
     min_turnover_cr = st.number_input(
-        "Min daily turnover (₹ crore, 0 = off)", min_value=0.0, value=0.0, step=0.5,
-        help="Price-normalized liquidity filter (better than share count): drops "
-             "stocks whose bhavcopy turnover value that day is below this. "
-             "Applies to All-NSE / SME scans. ₹1 crore ≈ a reasonable liquidity floor.",
+        "Min avg daily turnover (₹ crore, 0 = off)", min_value=0.0, value=0.0, step=0.5,
+        help="Skip stocks whose own average daily turnover (avg volume × price) is "
+             "below this during the scan. 0 = scan every stock regardless of turnover.",
     )
-
-    st.divider()
-    st.markdown("**🗂️ Bhavcopy cache**")
-    _cache_info = bhavcopy_cache_info()
-    _cache_mb = _cache_info["bytes"] / (1024 * 1024)
-    st.caption(
-        f"{_cache_info['files']} cached day(s) · {_cache_mb:.1f} MB. "
-        "The NSE bhavcopy is downloaded once per day and reused; clear it to force a fresh download."
-    )
-    if st.button("🗑️ Delete cached bhavcopy", disabled=_cache_info["files"] == 0,
-                 help="Removes the locally cached bhavcopy files. The next All-NSE scan re-downloads the latest copy."):
-        _cleared = clear_bhavcopy_cache()
-        st.success(f"Deleted {_cleared['deleted']} cached file(s), freed {_cleared['bytes_freed'] / (1024*1024):.1f} MB.")
-        st.rerun()
 
     st.divider()
     live_monitor = st.toggle("📗 Live Monitor (auto-refresh)", value=False)
@@ -601,28 +578,16 @@ if _scanning:
             tickers = list(NIFTY_INTRADAY_STOCKS)
 
         elif mode == "All NSE Stocks":
-            # Default to a sensible liquidity floor so the huge NSE universe is
-            # trimmed automatically; user can override via "Min avg daily volume".
-            _eff_minvol  = int(min_avg_vol) if min_avg_vol > 0 else _DEFAULT_NSE_MIN_VOL
-            _eff_minturn = float(min_turnover_cr) * 1e7
             with st.spinner("Downloading NSE bhavcopy to get all listed stocks..."):
-                tickers = fetch_all_nse_tickers(include_sme=False, min_volume=_eff_minvol,
-                                                min_turnover=_eff_minturn)
-            _floor_note = "" if min_avg_vol > 0 else " · default floor, change it in the sidebar"
-            _turn_note  = f" · turnover ≥ ₹{min_turnover_cr:g} cr" if min_turnover_cr > 0 else ""
-            st.info(f"📂 {len(tickers)} tradable NSE mainboard stocks loaded "
-                    f"(volume ≥ {_eff_minvol:,}{_floor_note}{_turn_note}). Large scan — may take several minutes.")
+                tickers = fetch_all_nse_tickers(include_sme=False)
+            st.info(f"📂 {len(tickers)} NSE mainboard stocks loaded — scanning all. "
+                    f"Large scan — may take several minutes.")
 
         elif mode == "All NSE + SME":
-            _eff_minvol  = int(min_avg_vol) if min_avg_vol > 0 else _DEFAULT_NSE_MIN_VOL
-            _eff_minturn = float(min_turnover_cr) * 1e7
             with st.spinner("Downloading NSE bhavcopy (mainboard + SME/Emerge)..."):
-                tickers = fetch_all_nse_tickers(include_sme=True, min_volume=_eff_minvol,
-                                                min_turnover=_eff_minturn)
-            _floor_note = "" if min_avg_vol > 0 else " · default floor, change it in the sidebar"
-            _turn_note  = f" · turnover ≥ ₹{min_turnover_cr:g} cr" if min_turnover_cr > 0 else ""
-            st.info(f"📂 {len(tickers)} tradable stocks loaded (mainboard + SME) "
-                    f"(volume ≥ {_eff_minvol:,}{_floor_note}{_turn_note}). Very large scan — may take 10–20+ minutes.")
+                tickers = fetch_all_nse_tickers(include_sme=True)
+            st.info(f"📂 {len(tickers)} stocks loaded (mainboard + SME) — scanning all. "
+                    f"Very large scan — may take 10–20+ minutes.")
 
         elif mode == "Custom Tickers":
             raw     = custom_input.replace(",", " ").replace("\n", " ").split()
@@ -694,6 +659,45 @@ if _scanning:
         st.warning("Scan cancelled.")
         st.stop()
 
+    # ── Render the results gathered so far, so the table stays visible for the
+    #    whole batch (not just a flash before the next rerun) ───────────────────
+    def _render_live():
+        _b = sum(1 for _r in results if _r["signal"] == "BUY")
+        _s = sum(1 for _r in results if _r["signal"] == "SELL")
+        _h = sum(1 for _r in results if _r["signal"] == "HOLD")
+        _skipped = len(newly_listed) + len(errors)
+        live_status.markdown(
+            f"**Scanned {_index} / {_total}** "
+            f"&nbsp;|&nbsp; BUY **{_b}** &nbsp; HOLD **{_h}** &nbsp; SELL **{_s}**"
+            + (f" &nbsp;|&nbsp; Skipped {_skipped}" if _skipped else "")
+        )
+        if results:
+            _partial = sorted(
+                results,
+                key=lambda x: ({"BUY": 0, "HOLD": 1, "SELL": 2, "VOID": 3}.get(x["signal"], 4), -x["score"])
+            )[:20]
+            _live_rows = [
+                {
+                    "Ticker":    _r["ticker"],
+                    "Price":     f"\u20b9{_r['price']:,.2f}",
+                    "Signal":    _signal_display(_r),
+                    "Score":     _r["score"],
+                    "RSI":       _r["rsi"],
+                    "Vol":       f"{_r['vol_ratio']}x",
+                    "Target":    f"\u20b9{_r['proj_up']:,.2f} ({_r['proj_up_pct']:+.1f}%)",
+                    "Stop":      f"\u20b9{_r['proj_down']:,.2f} ({_r['proj_down_pct']:+.1f}%)",
+                }
+                for _r in _partial
+            ]
+            with live_table_ph.container():
+                st.caption(f"Live results — top 20 of {len(results)} scanned (auto-saving progress)")
+                st.dataframe(
+                    pd.DataFrame(_live_rows).style.map(_style_signal, subset=["Signal"]),
+                    use_container_width=True, hide_index=True,
+                )
+
+    _render_live()
+
     # ── Process ONE time-boxed batch, persist, then rerun to keep going ────────
     _BATCH_SECONDS = 4.0
     _t0 = _time.time()
@@ -711,12 +715,17 @@ if _scanning:
             continue
         df = compute_indicators(df, interval)
 
-        # ── Liquidity filter: skip perpetually illiquid stocks ──
-        if min_avg_vol > 0:
+        # ── Optional liquidity filters (off by default → scan everything) ──
+        if min_avg_vol > 0 or min_turnover_cr > 0:
             _avg_vol = df["Vol_avg"].iloc[-1]
-            if pd.isna(_avg_vol) or _avg_vol < min_avg_vol:
+            if min_avg_vol > 0 and (pd.isna(_avg_vol) or _avg_vol < min_avg_vol):
                 skipped_lowvol += 1
                 continue
+            if min_turnover_cr > 0:
+                _avg_turnover = (0 if pd.isna(_avg_vol) else _avg_vol) * float(df["Close"].iloc[-1])
+                if _avg_turnover < float(min_turnover_cr) * 1e7:
+                    skipped_lowvol += 1
+                    continue
 
         sig = generate_signal(df, interval)
 
@@ -745,40 +754,8 @@ if _scanning:
     })
     _scan_state.save(_state)
 
-    # ── Live status + partial table ───────────────────────────────────────────
-    _b = sum(1 for _r in results if _r["signal"] == "BUY")
-    _s = sum(1 for _r in results if _r["signal"] == "SELL")
-    _h = sum(1 for _r in results if _r["signal"] == "HOLD")
-    _skipped = len(newly_listed) + len(errors)
-    live_status.markdown(
-        f"**Scanned {_index} / {_total}** "
-        f"&nbsp;|&nbsp; BUY **{_b}** &nbsp; HOLD **{_h}** &nbsp; SELL **{_s}**"
-        + (f" &nbsp;|&nbsp; Skipped {_skipped}" if _skipped else "")
-    )
-    if results:
-        _partial = sorted(
-            results,
-            key=lambda x: ({"BUY": 0, "HOLD": 1, "SELL": 2, "VOID": 3}.get(x["signal"], 4), -x["score"])
-        )[:20]
-        _live_rows = [
-            {
-                "Ticker":    _r["ticker"],
-                "Price":     f"\u20b9{_r['price']:,.2f}",
-                "Signal":    _signal_display(_r),
-                "Score":     _r["score"],
-                "RSI":       _r["rsi"],
-                "Vol":       f"{_r['vol_ratio']}x",
-                "Target":    f"\u20b9{_r['proj_up']:,.2f} ({_r['proj_up_pct']:+.1f}%)",
-                "Stop":      f"\u20b9{_r['proj_down']:,.2f} ({_r['proj_down_pct']:+.1f}%)",
-            }
-            for _r in _partial
-        ]
-        with live_table_ph.container():
-            st.caption(f"Live results — top 20 of {len(results)} scanned (auto-saving progress)")
-            st.dataframe(
-                pd.DataFrame(_live_rows).style.map(_style_signal, subset=["Signal"]),
-                use_container_width=True, hide_index=True,
-            )
+    # Refresh the table with this batch's freshly-scanned stocks before rerun.
+    _render_live()
 
     if not _done:
         # Yield briefly so the UI flushes, then drive the next batch.
