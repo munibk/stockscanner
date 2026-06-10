@@ -54,6 +54,9 @@ from watchlist import (
     is_watched,
 )
 
+import scan_state as _scan_state
+importlib.reload(_scan_state)
+
 # Default liquidity floor applied to All-NSE / All-NSE+SME scans when the user
 # hasn't set their own "Min avg daily volume" (keeps the huge universe tradable).
 _DEFAULT_NSE_MIN_VOL = 50_000
@@ -259,18 +262,64 @@ with st.sidebar:
     st.divider()
     st.caption("ℹ️ Zerodha Portfolio: add api_key & api_secret to Streamlit Secrets, then log in from the sidebar.")
 # ── Auto-run when live monitor is active ────────────────────────────────────────
-run = run or (live_monitor and st.session_state.get("live_active", False))
+# Keep the genuine button press distinct from the live-monitor auto-refresh so the
+# resumable-scan logic can tell "user wants a fresh scan" from "keep the loop going".
+run_clicked = run
+live_auto   = live_monitor and st.session_state.get("live_active", False)
+run = run_clicked or live_auto
 
 
 # ── Signal cell styler (shared by watchlist, live table, final table) ─────────
 def _style_signal(val):
-    if val == "BUY":
+    v = str(val)
+    if v.startswith("BUY"):
         return "background-color: #0d3b26; color: #00e676; font-weight: bold"
-    if val == "SELL":
+    if v.startswith("SELL"):
         return "background-color: #3b0d0d; color: #ff5252; font-weight: bold"
-    if val == "VOID":
+    if v.startswith("VOID"):
         return "background-color: #1a1a1a; color: #888888; font-weight: bold"
     return "background-color: #3b3b0d; color: #ffd600"
+
+
+def _signal_display(r: dict) -> str:
+    """Human-readable signal that exposes *why* a strong score is a HOLD.
+
+    When the score-implied signal (BUY/SELL) was downgraded to HOLD by a
+    post-score filter, show it as e.g. ``HOLD (stale BUY 72)`` or
+    ``HOLD (HTF BUY 72)`` so the reason is obvious at a glance in the table.
+    """
+    sig = r.get("signal", "")
+    if sig != "HOLD":
+        return sig
+    base = r.get("base_signal")
+    if base not in ("BUY", "SELL"):
+        return sig
+    dg = r.get("downgrade")
+    reason = {"stale": "stale", "htf": "HTF"}.get(dg)
+    if not reason:
+        return sig
+    return f"HOLD ({reason} {base} {r.get('score', 0):.0f})"
+
+
+def _ensure_df(r: dict, interval: str):
+    """Return the candle frame for a result, re-fetching it if it was dropped.
+
+    Candle frames are not persisted in the on-disk scan checkpoint (to keep it
+    small), so a scan resumed after a real disconnect has ``_df is None`` for the
+    stocks processed before the interruption. Re-fetch on demand when a chart or
+    comparison actually needs it.
+    """
+    df = r.get("_df")
+    if df is not None:
+        return df
+    try:
+        df = fetch_data(r["ticker"], interval)
+        if df is not None:
+            df = compute_indicators(df, interval)
+            r["_df"] = df
+        return df
+    except Exception:
+        return None
 
 
 # ── Watchlist page (short-circuits the scanner flow) ─────────────────────────
@@ -495,8 +544,28 @@ _cache_fresh = (
     and (_time.time() - _cached["ts"]) < _ttl
 )
 
-# ── Welcome screen (skipped when cached data can be shown) ───────────────────
-if not run and not _cache_fresh:
+# ── Resumable-scan control flags ─────────────────────────────────────────────
+# A long scan is processed in short time-boxed batches that persist progress to
+# disk (.scancache/) and drive themselves forward with st.rerun(). This keeps the
+# script alive in small slices, so a screen-lock / disconnect / refresh loses at
+# most one batch — on reconnect we pick the interrupted scan up where it stopped
+# instead of starting over.
+_disk_cur            = _scan_state.load(_ck)
+_inprogress_current  = bool(_disk_cur and _disk_cur.get("status") == "running")
+
+# A genuine click (or a live-monitor tick with nothing already running) starts a
+# fresh scan; otherwise we continue / resume whatever was interrupted.
+_should_start = run_clicked or (live_auto and not _inprogress_current and not _cache_fresh)
+
+_resume = None
+if not _should_start and not _cache_fresh:
+    if _inprogress_current:
+        _resume = _disk_cur
+    else:
+        _resume = _scan_state.load_active()   # an interrupted scan from any ck
+
+# ── Welcome screen (only when there's nothing to show, run or resume) ─────────
+if not _should_start and not _cache_fresh and _resume is None:
     st.title("📈 Nifty Stock Signal Scanner")
     st.markdown("Configure options in the **sidebar** and click **Run Scan** to start.")
     st.divider()
@@ -507,7 +576,7 @@ if not run and not _cache_fresh:
     st.stop()
 
 # ── Fast path: load results from session-state cache ─────────────────────────
-if _cache_fresh:
+if _cache_fresh and not _should_start and _resume is None:
     results      = _cached["results"]
     errors       = _cached["errors"]
     newly_listed = _cached["newly_listed"]
@@ -519,78 +588,119 @@ if _cache_fresh:
         f"click **Run Scan** to fetch fresh data."
     )
 
-# ── Resolve tickers + scan (skipped on cache hit) ────────────────────────────
-if not _cache_fresh:
-    if mode == "Nifty 50":
-        with st.spinner("Fetching Nifty 50 constituents from NSE..."):
-            tickers = fetch_nifty50_tickers()
+# ── Active scan: start fresh OR resume an interrupted one ─────────────────────
+_scanning = _should_start or (_resume is not None)
+if _scanning:
+    if _should_start:
+        # ---- Resolve the ticker universe for the current sidebar selection ----
+        if mode == "Nifty 50":
+            with st.spinner("Fetching Nifty 50 constituents from NSE..."):
+                tickers = fetch_nifty50_tickers()
 
-    elif mode == "Intraday Picks (top 30)":
-        tickers = list(NIFTY_INTRADAY_STOCKS)
+        elif mode == "Intraday Picks (top 30)":
+            tickers = list(NIFTY_INTRADAY_STOCKS)
 
-    elif mode == "All NSE Stocks":
-        # Default to a sensible liquidity floor so the huge NSE universe is
-        # trimmed automatically; the user can override via "Min avg daily volume".
-        _eff_minvol  = int(min_avg_vol) if min_avg_vol > 0 else _DEFAULT_NSE_MIN_VOL
-        _eff_minturn = float(min_turnover_cr) * 1e7
-        with st.spinner("Downloading NSE bhavcopy to get all listed stocks..."):
-            tickers = fetch_all_nse_tickers(include_sme=False, min_volume=_eff_minvol,
-                                            min_turnover=_eff_minturn)
-        _floor_note = "" if min_avg_vol > 0 else " · default floor, change it in the sidebar"
-        _turn_note  = f" · turnover ≥ ₹{min_turnover_cr:g} cr" if min_turnover_cr > 0 else ""
-        st.info(f"📂 {len(tickers)} tradable NSE mainboard stocks loaded "
-                f"(volume ≥ {_eff_minvol:,}{_floor_note}{_turn_note}). Large scan — may take several minutes.")
+        elif mode == "All NSE Stocks":
+            # Default to a sensible liquidity floor so the huge NSE universe is
+            # trimmed automatically; user can override via "Min avg daily volume".
+            _eff_minvol  = int(min_avg_vol) if min_avg_vol > 0 else _DEFAULT_NSE_MIN_VOL
+            _eff_minturn = float(min_turnover_cr) * 1e7
+            with st.spinner("Downloading NSE bhavcopy to get all listed stocks..."):
+                tickers = fetch_all_nse_tickers(include_sme=False, min_volume=_eff_minvol,
+                                                min_turnover=_eff_minturn)
+            _floor_note = "" if min_avg_vol > 0 else " · default floor, change it in the sidebar"
+            _turn_note  = f" · turnover ≥ ₹{min_turnover_cr:g} cr" if min_turnover_cr > 0 else ""
+            st.info(f"📂 {len(tickers)} tradable NSE mainboard stocks loaded "
+                    f"(volume ≥ {_eff_minvol:,}{_floor_note}{_turn_note}). Large scan — may take several minutes.")
 
-    elif mode == "All NSE + SME":
-        _eff_minvol  = int(min_avg_vol) if min_avg_vol > 0 else _DEFAULT_NSE_MIN_VOL
-        _eff_minturn = float(min_turnover_cr) * 1e7
-        with st.spinner("Downloading NSE bhavcopy (mainboard + SME/Emerge)..."):
-            tickers = fetch_all_nse_tickers(include_sme=True, min_volume=_eff_minvol,
-                                            min_turnover=_eff_minturn)
-        _floor_note = "" if min_avg_vol > 0 else " · default floor, change it in the sidebar"
-        _turn_note  = f" · turnover ≥ ₹{min_turnover_cr:g} cr" if min_turnover_cr > 0 else ""
-        st.info(f"📂 {len(tickers)} tradable stocks loaded (mainboard + SME) "
-                f"(volume ≥ {_eff_minvol:,}{_floor_note}{_turn_note}). Very large scan — may take 10–20+ minutes.")
+        elif mode == "All NSE + SME":
+            _eff_minvol  = int(min_avg_vol) if min_avg_vol > 0 else _DEFAULT_NSE_MIN_VOL
+            _eff_minturn = float(min_turnover_cr) * 1e7
+            with st.spinner("Downloading NSE bhavcopy (mainboard + SME/Emerge)..."):
+                tickers = fetch_all_nse_tickers(include_sme=True, min_volume=_eff_minvol,
+                                                min_turnover=_eff_minturn)
+            _floor_note = "" if min_avg_vol > 0 else " · default floor, change it in the sidebar"
+            _turn_note  = f" · turnover ≥ ₹{min_turnover_cr:g} cr" if min_turnover_cr > 0 else ""
+            st.info(f"📂 {len(tickers)} tradable stocks loaded (mainboard + SME) "
+                    f"(volume ≥ {_eff_minvol:,}{_floor_note}{_turn_note}). Very large scan — may take 10–20+ minutes.")
 
-    elif mode == "Custom Tickers":
-        raw     = custom_input.replace(",", " ").replace("\n", " ").split()
-        tickers = [t.upper().strip() for t in raw if t.strip()]
-        if not tickers:
-            st.error("Enter at least one ticker in the sidebar.")
-            st.stop()
+        elif mode == "Custom Tickers":
+            raw     = custom_input.replace(",", " ").replace("\n", " ").split()
+            tickers = [t.upper().strip() for t in raw if t.strip()]
+            if not tickers:
+                st.error("Enter at least one ticker in the sidebar.")
+                st.stop()
 
-    else:  # Zerodha Portfolio
-        if "kite_access_token" not in st.session_state:
-            st.warning("Please log in to Zerodha using the sidebar first.")
-            st.stop()
-        try:
-            tickers = fetch_zerodha_holdings_with_token(
-                st.session_state["kite_api_key"],
-                st.session_state["kite_access_token"],
+        else:  # Zerodha Portfolio
+            if "kite_access_token" not in st.session_state:
+                st.warning("Please log in to Zerodha using the sidebar first.")
+                st.stop()
+            try:
+                tickers = fetch_zerodha_holdings_with_token(
+                    st.session_state["kite_api_key"],
+                    st.session_state["kite_access_token"],
+                )
+            except Exception as e:
+                st.error(f"Failed to fetch Zerodha holdings: {e}")
+                st.stop()
+            if not tickers:
+                st.warning("No holdings or open positions found in your Zerodha account.")
+                st.stop()
+
+        _active_ck = _ck
+        _state = {
+            "ck": _ck, "mode": mode, "interval": interval,
+            "tickers": tickers, "index": 0,
+            "results": [], "errors": [], "newly_listed": [], "skipped_lowvol": 0,
+            "status": "running", "started": _time.time(), "updated": _time.time(),
+        }
+        st.session_state.setdefault("scan_mem", {})[_active_ck] = {}
+        _scan_state.save(_state)
+    else:
+        # ---- Resume an interrupted scan (its saved context wins over sidebar) ----
+        _state     = _resume
+        _active_ck = _state["ck"]
+        mode       = _state.get("mode", mode)
+        interval   = _state.get("interval", interval)
+        tickers    = _state["tickers"]
+        if _active_ck != _ck:
+            st.info(
+                f"♻️ Resuming an interrupted **{mode} · {interval}** scan that was "
+                f"stopped (e.g. screen-lock) — {_state['index']}/{len(tickers)} done. "
+                f"Use the sidebar selection above to start a different scan instead."
             )
-        except Exception as e:
-            st.error(f"Failed to fetch Zerodha holdings: {e}")
-            st.stop()
-        if not tickers:
-            st.warning("No holdings or open positions found in your Zerodha account.")
-            st.stop()
 
-    # ── Scan ──────────────────────────────────────────────────────────────────
-    results      = []
-    errors       = []
-    newly_listed = []
-    skipped_lowvol = 0
+    _mem = st.session_state.setdefault("scan_mem", {}).setdefault(_active_ck, {})
 
-    progress_bar  = st.progress(0, text="Starting scan...")
+    results        = _state["results"]
+    errors         = _state["errors"]
+    newly_listed   = _state["newly_listed"]
+    skipped_lowvol = _state["skipped_lowvol"]
+    _index         = _state["index"]
+    _total         = len(tickers)
+    # Re-attach any candle frames still in memory (lost after a real disconnect —
+    # those are re-fetched lazily when a chart is opened).
+    for _r in results:
+        _r["_df"] = _mem.get(_r["ticker"])
+
+    progress_bar  = st.progress(_index / _total if _total else 0.0, text="Starting scan...")
     live_status   = st.empty()
     live_table_ph = st.empty()
 
-    # refresh the live table ~20 times across the full list
-    _UPDATE_EVERY = max(1, min(10, max(1, len(tickers) // 20)))
+    if st.button("⏹ Cancel scan", key="cancel_scan"):
+        _scan_state.clear(_active_ck)
+        st.session_state.get("scan_mem", {}).pop(_active_ck, None)
+        st.session_state.pop("live_active", None)
+        st.warning("Scan cancelled.")
+        st.stop()
 
-    for i, ticker in enumerate(tickers):
-        pct = (i + 1) / len(tickers)
-        progress_bar.progress(pct, text=f"Scanning {ticker}  ({i+1}/{len(tickers)})")
+    # ── Process ONE time-boxed batch, persist, then rerun to keep going ────────
+    _BATCH_SECONDS = 4.0
+    _t0 = _time.time()
+    while _index < _total and (_time.time() - _t0) < _BATCH_SECONDS:
+        ticker = tickers[_index]
+        _index += 1
+        progress_bar.progress(_index / _total, text=f"Scanning {ticker}  ({_index}/{_total})")
         try:
             df = fetch_data(ticker, interval)
         except _NewlyListedError as e:
@@ -599,7 +709,7 @@ if not _cache_fresh:
         if df is None:
             errors.append(ticker)
             continue
-        df  = compute_indicators(df, interval)
+        df = compute_indicators(df, interval)
 
         # ── Liquidity filter: skip perpetually illiquid stocks ──
         if min_avg_vol > 0:
@@ -622,58 +732,72 @@ if not _cache_fresh:
 
         sig["ticker"] = ticker
         sig["_df"]    = df
+        _mem[ticker]  = df
         results.append(sig)
 
-        # live table update every _UPDATE_EVERY stocks (and always on the last one)
-        if results and (len(results) % _UPDATE_EVERY == 0 or i == len(tickers) - 1):
-            _b = sum(1 for _r in results if _r["signal"] == "BUY")
-            _s = sum(1 for _r in results if _r["signal"] == "SELL")
-            _h = sum(1 for _r in results if _r["signal"] == "HOLD")
-            _skipped = len(newly_listed) + len(errors)
-            live_status.markdown(
-                f"**Scanned {i+1} / {len(tickers)}** "
-                f"&nbsp;|&nbsp; BUY **{_b}** &nbsp; HOLD **{_h}** &nbsp; SELL **{_s}**"
-                + (f" &nbsp;|&nbsp; Skipped {_skipped}" if _skipped else "")
-            )
-            _partial = sorted(
-                results,
-                key=lambda x: ({"BUY": 0, "HOLD": 1, "SELL": 2, "VOID": 3}.get(x["signal"], 4), -x["score"])
-            )[:20]
-            _live_rows = [
-                {
-                    "Ticker":    _r["ticker"],
-                    "Price":     f"\u20b9{_r['price']:,.2f}",
-                    "Signal":    _r["signal"],
-                    "Score":     _r["score"],
-                    "RSI":       _r["rsi"],
-                    "Vol":       f"{_r['vol_ratio']}x",
-                    "Target":    f"\u20b9{_r['proj_up']:,.2f} ({_r['proj_up_pct']:+.1f}%)",
-                    "Stop":      f"\u20b9{_r['proj_down']:,.2f} ({_r['proj_down_pct']:+.1f}%)",
-                }
-                for _r in _partial
-            ]
-            with live_table_ph.container():
-                st.caption(
-                    f"Live results — top 20 of {len(results)} scanned "
-                    f"(refreshes every {_UPDATE_EVERY} stocks)"
-                )
-                st.dataframe(
-                    pd.DataFrame(_live_rows).style.map(_style_signal, subset=["Signal"]),
-                    use_container_width=True, hide_index=True,
-                )
+    # ── Persist this batch's progress to disk ─────────────────────────────────
+    _done = _index >= _total
+    _state.update({
+        "index": _index, "results": results, "errors": errors,
+        "newly_listed": newly_listed, "skipped_lowvol": skipped_lowvol,
+        "mode": mode, "interval": interval,
+        "status": "done" if _done else "running",
+    })
+    _scan_state.save(_state)
 
+    # ── Live status + partial table ───────────────────────────────────────────
+    _b = sum(1 for _r in results if _r["signal"] == "BUY")
+    _s = sum(1 for _r in results if _r["signal"] == "SELL")
+    _h = sum(1 for _r in results if _r["signal"] == "HOLD")
+    _skipped = len(newly_listed) + len(errors)
+    live_status.markdown(
+        f"**Scanned {_index} / {_total}** "
+        f"&nbsp;|&nbsp; BUY **{_b}** &nbsp; HOLD **{_h}** &nbsp; SELL **{_s}**"
+        + (f" &nbsp;|&nbsp; Skipped {_skipped}" if _skipped else "")
+    )
+    if results:
+        _partial = sorted(
+            results,
+            key=lambda x: ({"BUY": 0, "HOLD": 1, "SELL": 2, "VOID": 3}.get(x["signal"], 4), -x["score"])
+        )[:20]
+        _live_rows = [
+            {
+                "Ticker":    _r["ticker"],
+                "Price":     f"\u20b9{_r['price']:,.2f}",
+                "Signal":    _signal_display(_r),
+                "Score":     _r["score"],
+                "RSI":       _r["rsi"],
+                "Vol":       f"{_r['vol_ratio']}x",
+                "Target":    f"\u20b9{_r['proj_up']:,.2f} ({_r['proj_up_pct']:+.1f}%)",
+                "Stop":      f"\u20b9{_r['proj_down']:,.2f} ({_r['proj_down_pct']:+.1f}%)",
+            }
+            for _r in _partial
+        ]
+        with live_table_ph.container():
+            st.caption(f"Live results — top 20 of {len(results)} scanned (auto-saving progress)")
+            st.dataframe(
+                pd.DataFrame(_live_rows).style.map(_style_signal, subset=["Signal"]),
+                use_container_width=True, hide_index=True,
+            )
+
+    if not _done:
+        # Yield briefly so the UI flushes, then drive the next batch.
+        _time.sleep(0.05)
+        st.rerun()
+
+    # ── Scan complete: promote to session cache, clean up, render below ────────
     progress_bar.empty()
     live_status.empty()
-    live_table_ph.empty()   # full results section renders below
-
-    # ── Save scan results to session-state cache ───────────────────────────────
-    st.session_state.setdefault("scan_cache", {})[_ck] = {
+    live_table_ph.empty()
+    st.session_state.setdefault("scan_cache", {})[_active_ck] = {
         "ts":          _time.time(),
         "results":     results,
         "errors":      errors,
         "newly_listed": newly_listed,
         "skipped_lowvol": skipped_lowvol,
     }
+    _scan_state.clear(_active_ck)
+    st.session_state.get("scan_mem", {}).pop(_active_ck, None)
 
 # ── Warnings / errors ────────────────────────────────────────────────────────
 for tkr, rows in newly_listed:
@@ -876,7 +1000,7 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
         _row = {
             "Ticker":    r["ticker"],
             "Price (₹)": f"₹{r['price']:,.2f}",
-            "Signal":    r["signal"],
+            "Signal":    _signal_display(r),
             "Score":     r["score"],
             "RSI":       r["rsi"],
             "ADX":       r["adx"] if r["adx"] else None,
@@ -921,7 +1045,7 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
         if r["ticker"] not in _detail_tickers:
             continue
         sig_icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡", "VOID": "⚫"}.get(r["signal"], "🟡")
-        label    = f"{sig_icon}  **{r['ticker']}**  —  {r['signal']}  ({r['score']:.0f}/100)  ₹{r['price']:,.2f}"
+        label    = f"{sig_icon}  **{r['ticker']}**  —  {_signal_display(r)}  ({r['score']:.0f}/100)  ₹{r['price']:,.2f}"
 
         with st.expander(label, expanded=(len(results) == 1)):
             _tab_detail, _tab_chart = st.tabs(["📋 Details", "📈 Chart"])
@@ -935,7 +1059,7 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
                     "HOLD": "background:#3b3b0d;color:#ffd600;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
                     "VOID": "background:#1a1a1a;color:#888888;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem",
                 }.get(r["signal"], "background:#3b3b0d;color:#ffd600;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem")
-                st.markdown(f'<span style="{_badge_css}">{r["signal"]} &nbsp; {r["score"]:.0f}/100</span>', unsafe_allow_html=True)
+                st.markdown(f'<span style="{_badge_css}">{_signal_display(r)} &nbsp; {r["score"]:.0f}/100</span>', unsafe_allow_html=True)
                 st.markdown("")
 
                 if is_watched(r["ticker"], interval):
@@ -1021,7 +1145,9 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
 
                 # ── Prediction comparison panel (full width) ──────────────
                 if compare_date:
-                    _all_df   = r["_df"]
+                    _all_df   = _ensure_df(r, interval)
+                    if _all_df is None:
+                        _all_df = pd.DataFrame(index=pd.DatetimeIndex([]))
                     _hist_mask = _all_df.index.normalize() <= pd.Timestamp(compare_date)
                     _df_hist  = _all_df[_hist_mask]
                     _df_future = _all_df[~_hist_mask]
@@ -1077,7 +1203,16 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
 
             # ── Chart tab (full width) ─────────────────────────────────────
             with _tab_chart:
-                df_c = r["_df"].tail(150).copy()
+                _chart_df = r.get("_df")
+                if _chart_df is None:
+                    # Candle data was dropped (resumed-after-disconnect scan).
+                    # Re-fetch only when the user actually opens this chart.
+                    if st.button("📈 Load chart", key=f"loadchart_{r['ticker']}"):
+                        _chart_df = _ensure_df(r, interval)
+                if _chart_df is None:
+                    st.caption("Chart data not loaded — click **Load chart** to fetch it.")
+                    continue
+                df_c = _chart_df.tail(150).copy()
 
                 fig = make_subplots(
                     rows=4, cols=1,

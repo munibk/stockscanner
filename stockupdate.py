@@ -1003,7 +1003,8 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
 
     def _make_result(signal, score, reasons, regime, stop_loss, target1, target2, rr,
                      bos_bull=False, bos_bear=False, rsi_bull_div=False, rsi_bear_div=False,
-                     htf_bullish=None, cooldown=False, vwap=None, vwap_pct=None):
+                     htf_bullish=None, cooldown=False, vwap=None, vwap_pct=None,
+                     base_signal=None, downgrade=None):
         sr          = _sr_result()
         proj_up     = proj_up_base
         proj_down   = proj_down_base
@@ -1060,6 +1061,8 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
             "rsi_bear_div":  rsi_bear_div,
             "htf_bullish":   htf_bullish,
             "cooldown":      cooldown,
+            "base_signal":   base_signal if base_signal is not None else signal,
+            "downgrade":     downgrade,
         }
 
     # ── Volume Veto ───────────────────────────────────────────────────────────
@@ -1263,6 +1266,11 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
     else:
         signal = "HOLD"
 
+    # Remember the score-implied signal so the UI can explain *why* a high/low
+    # score ended up as HOLD (e.g. "stale BUY" after a cooldown downgrade).
+    base_signal = signal
+    downgrade   = None
+
     # ── Signal Cooldown ───────────────────────────────────────────────────────
     cooldown = False
     cd_bars  = _COOLDOWN_BARS.get(interval, 5)
@@ -1281,15 +1289,18 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
                 cooldown = True
         if cooldown:
             signal = "HOLD"
+            downgrade = "stale"
             reasons.append(f"⚠ Signal cooldown — no fresh MACD crossover in last {cd_bars} bars (stale signal)")
 
     # ── Layer 2: HTF Filter ───────────────────────────────────────────────────
     if htf_bullish is not None:
         if signal == "BUY" and not htf_bullish:
             signal = "HOLD"
+            downgrade = "htf"
             reasons.append("⚠ HTF daily trend is bearish — LTF BUY downgraded to HOLD")
         elif signal == "SELL" and htf_bullish:
             signal = "HOLD"
+            downgrade = "htf"
             reasons.append("⚠ HTF daily trend is bullish — LTF SELL downgraded to HOLD")
 
     # ── Layer 4: assign stop/target based on direction ────────────────────────
@@ -1304,6 +1315,7 @@ def generate_signal(df: pd.DataFrame, interval: str = "1d") -> dict:
         bos_bull=bos_bull, bos_bear=bos_bear,
         rsi_bull_div=rsi_bull_div, rsi_bear_div=rsi_bear_div,
         htf_bullish=htf_bullish, cooldown=cooldown,
+        base_signal=base_signal, downgrade=downgrade,
         vwap=vwap, vwap_pct=vwap_pct,
     )
 
