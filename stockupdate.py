@@ -41,13 +41,21 @@ from tabulate import tabulate
 
 # Windows consoles default to cp1252 and crash on the ✓ / ⚠ / box-drawing glyphs
 # used in CLI output. Force UTF-8 so the CLI works everywhere.
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-
-init(autoreset=True)
+#
+# IMPORTANT: app.py calls importlib.reload(stockupdate) on every Streamlit rerun.
+# colorama.init() wraps sys.stdout, so re-running it on each reload stacks a fresh
+# wrapper around the previous one. On a long-lived server (Streamlit Cloud) that
+# chain grows until a single print() recurses through every layer and raises
+# RecursionError. Guard the one-time IO setup with a sentinel on `sys` (which is
+# never reloaded) so it runs at most once per process.
+if not getattr(sys, "_stockupdate_io_configured", False):
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    init(autoreset=True)
+    sys._stockupdate_io_configured = True
 
 # ── Zerodha / Kite Connect integration ────────────────────────────────────────
 CONFIG_FILE  = os.path.join(os.path.dirname(__file__), "zerodha.cfg")
