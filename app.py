@@ -679,6 +679,47 @@ m3.metric("🟡 HOLD", holds)
 m4.metric("🔴 SELL", sells)
 m5.metric("⚫ VOID",  voids)
 
+# ── Bulk "Add to Watchlist" (works for every scanned stock, all modes) ────────
+with st.expander("⭐ Add scanned stocks to your watchlist", expanded=False):
+    _res_by_tkr = {r["ticker"]: r for r in results}
+    _sig_filter = st.multiselect(
+        "Filter by signal (optional)",
+        ["BUY", "SELL", "HOLD", "VOID"],
+        default=[],
+        key="wl_bulk_sigfilter",
+    )
+    _options = [
+        r["ticker"] for r in results
+        if (not _sig_filter or r["signal"] in _sig_filter)
+        and not is_watched(r["ticker"], interval)
+    ]
+    st.caption(
+        f"{len(_options)} stock(s) available to add on the **{interval}** timeframe "
+        f"(already-watched stocks are hidden). Current signal, price & score are snapshotted."
+    )
+    _picked = st.multiselect("Select stocks to add", _options, key="wl_bulk_select")
+    _bc1, _bc2 = st.columns([1, 1])
+    if _bc1.button("⭐ Add selected", disabled=not _picked, type="primary"):
+        _n = 0
+        for _tk in _picked:
+            _r = _res_by_tkr.get(_tk)
+            if _r:
+                _ok, _ = add_to_watchlist(_tk, _r["price"], _r["signal"], _r["score"], interval)
+                _n += int(_ok)
+        st.session_state.pop("wl_eval_cache", None)
+        st.toast(f"Added {_n} stock(s) to your watchlist", icon="⭐")
+        st.rerun()
+    if _sig_filter and _bc2.button(f"⭐ Add ALL {len(_options)} filtered", disabled=not _options):
+        _n = 0
+        for _tk in _options:
+            _r = _res_by_tkr.get(_tk)
+            if _r:
+                _ok, _ = add_to_watchlist(_tk, _r["price"], _r["signal"], _r["score"], interval)
+                _n += int(_ok)
+        st.session_state.pop("wl_eval_cache", None)
+        st.toast(f"Added {_n} stock(s) to your watchlist", icon="⭐")
+        st.rerun()
+
 st.divider()
 
 # ── Price band grouping ───────────────────────────────────────────────────────
