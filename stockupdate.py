@@ -39,6 +39,14 @@ import yfinance as yf
 from colorama import Fore, Style, init
 from tabulate import tabulate
 
+# Windows consoles default to cp1252 and crash on the ✓ / ⚠ / box-drawing glyphs
+# used in CLI output. Force UTF-8 so the CLI works everywhere.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 init(autoreset=True)
 
 # ── Zerodha / Kite Connect integration ────────────────────────────────────────
@@ -216,53 +224,169 @@ def fetch_nifty50_tickers() -> list[str]:
     return list(NIFTY_50_FALLBACK)
 
 
-def fetch_all_nse_tickers(include_sme: bool = True) -> list[str]:
+# ── Bhavcopy disk cache (download each trading day's file at most once) ───────
+_BHAV_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".bhavcache")
+_BHAV_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0.0.0 Safari/537.36",
+    "Referer": "https://www.nseindia.com/",
+}
+
+
+def _get_bhavcopy(dt: date, timeout: int = 25) -> "pd.DataFrame | None":
     """
-    Fetch every NSE-listed equity from the latest available daily bhavcopy.
-    Mainboard stocks use the bare symbol (e.g. RELIANCE).
-    SME/Emerge stocks get a -SM suffix (e.g. PRANIK-SM) when include_sme=True.
-    Falls back to the Nifty 50 fallback list if the download fails.
+    Return the parsed NSE CM bhavcopy for `dt`, backed by a local once-per-day
+    disk cache (.bhavcache/). The published bhavcopy for a settled trading day
+    never changes, so once cached it is reused for the rest of the day (and
+    beyond) instead of being re-downloaded on every scan.
+
+    Returns None when that date has no bhavcopy (weekend / holiday / not yet
+    published). Such misses are negatively cached only for dates older than two
+    days, so a not-yet-published recent date is still retried later.
     """
     import io
     import zipfile
 
-    bhav_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/124.0.0.0 Safari/537.36",
-        "Referer": "https://www.nseindia.com/",
-    }
+    ds         = dt.strftime("%Y%m%d")
+    cache_path = os.path.join(_BHAV_CACHE_DIR, f"BhavCopy_{ds}.csv")
+    miss_path  = cache_path + ".miss"
 
+    # Positive cache hit — reuse the already-downloaded file.
+    if os.path.exists(cache_path):
+        try:
+            return pd.read_csv(cache_path, dtype=str)
+        except Exception:
+            pass
+
+    # Negative cache hit — only trusted for settled past dates.
+    if os.path.exists(miss_path) and dt < date.today() - timedelta(days=2):
+        return None
+
+    url = (f"https://nsearchives.nseindia.com/content/cm/"
+           f"BhavCopy_NSE_CM_0_0_0_{ds}_F_0000.csv.zip")
+    try:
+        resp = requests.get(url, headers=_BHAV_HEADERS, timeout=timeout)
+        if resp.status_code != 200:
+            try:
+                os.makedirs(_BHAV_CACHE_DIR, exist_ok=True)
+                open(miss_path, "w").close()
+            except Exception:
+                pass
+            return None
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+            raw = z.read(z.namelist()[0])
+        try:
+            os.makedirs(_BHAV_CACHE_DIR, exist_ok=True)
+            with open(cache_path, "wb") as f:
+                f.write(raw)
+        except Exception:
+            pass
+        return pd.read_csv(io.BytesIO(raw), dtype=str)
+    except Exception:
+        return None
+
+
+def bhavcopy_cache_info() -> dict:
+    """Return {'files': N, 'bytes': total} for the on-disk bhavcopy cache."""
+    files = 0
+    total = 0
+    try:
+        for name in os.listdir(_BHAV_CACHE_DIR):
+            if name.endswith(".csv"):
+                fp = os.path.join(_BHAV_CACHE_DIR, name)
+                if os.path.isfile(fp):
+                    files += 1
+                    total += os.path.getsize(fp)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return {"files": files, "bytes": total}
+
+
+def clear_bhavcopy_cache() -> dict:
+    """
+    Delete all cached bhavcopy files (.csv and .miss markers).
+    Returns {'deleted': N, 'bytes_freed': total} for the .csv files removed.
+    """
+    deleted = 0
+    freed = 0
+    try:
+        for name in os.listdir(_BHAV_CACHE_DIR):
+            if name.startswith("BhavCopy_") and (name.endswith(".csv") or name.endswith(".csv.miss")):
+                fp = os.path.join(_BHAV_CACHE_DIR, name)
+                try:
+                    if name.endswith(".csv"):
+                        freed += os.path.getsize(fp)
+                        deleted += 1
+                    os.remove(fp)
+                except Exception:
+                    pass
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return {"deleted": deleted, "bytes_freed": freed}
+
+
+def fetch_all_nse_tickers(include_sme: bool = True,
+                          min_volume: int = 0,
+                          min_turnover: float = 0.0) -> list[str]:
+    """
+    Fetch every NSE-listed equity from the latest available daily bhavcopy.
+    Mainboard stocks use the bare symbol (e.g. RELIANCE).
+    SME/Emerge stocks get a -SM suffix (e.g. PRANIK-SM) when include_sme=True.
+
+    Liquidity pre-filter (uses the bhavcopy's own traded-volume column, so it
+    costs nothing — no extra network calls):
+      • Stocks with ZERO traded volume that day are always dropped.
+      • min_volume    — keep only symbols with traded volume >= this (shares).
+      • min_turnover  — keep only symbols with turnover value >= this (rupees).
+    This trims the universe (often by 30–50%) before the slow per-ticker fetch.
+
+    Falls back to the Nifty 50 fallback list if the download fails.
+
+    The bhavcopy is fetched through a once-per-day disk cache, so repeated
+    All-NSE scans on the same day reuse the already-downloaded file.
+    """
     for days_back in range(10):          # try up to 10 calendar days back
         dt = date.today() - timedelta(days=days_back)
         if dt.weekday() >= 5:            # skip Saturday / Sunday
             continue
-        ds  = dt.strftime("%Y%m%d")
-        url = (f"https://nsearchives.nseindia.com/content/cm/"
-               f"BhavCopy_NSE_CM_0_0_0_{ds}_F_0000.csv.zip")
+        bhav = _get_bhavcopy(dt)
+        if bhav is None:
+            continue
         try:
-            resp = requests.get(url, headers=bhav_headers, timeout=25)
-            if resp.status_code != 200:
-                continue
-            with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-                bhav = pd.read_csv(z.open(z.namelist()[0]), dtype=str)
-
             bhav["SctySrs"]  = bhav["SctySrs"].str.strip().str.upper()
             bhav["TckrSymb"] = bhav["TckrSymb"].str.strip().str.upper()
 
-            tickers: list[str] = []
-            tickers.extend(bhav.loc[bhav["SctySrs"] == "EQ", "TckrSymb"].tolist())
+            # Sanity-check the parse on the UNFILTERED universe before applying
+            # the liquidity filter (so an aggressive filter can't be mistaken for
+            # a broken bhavcopy and trigger a needless retry / fallback).
+            series_mask = bhav["SctySrs"].isin(["EQ", "SM"] if include_sme else ["EQ"])
+            raw_total = int(series_mask.sum())
+            if raw_total <= 100:
+                continue
+
+            # Liquidity columns (UDiFF bhavcopy): traded volume + turnover value.
+            vol_num = pd.to_numeric(bhav.get("TtlTradgVol"), errors="coerce").fillna(0)
+            val_num = pd.to_numeric(bhav.get("TtlTrfVal"),  errors="coerce").fillna(0)
+            liquid  = (vol_num > 0) & (vol_num >= min_volume) & (val_num >= min_turnover)
+
+            eq_mask = (bhav["SctySrs"] == "EQ") & liquid
+            tickers = bhav.loc[eq_mask, "TckrSymb"].tolist()
             if include_sme:
-                tickers.extend(
-                    sym + "-SM"
-                    for sym in bhav.loc[bhav["SctySrs"] == "SM", "TckrSymb"].tolist()
-                )
+                sm_mask = (bhav["SctySrs"] == "SM") & liquid
+                tickers += [sym + "-SM" for sym in bhav.loc[sm_mask, "TckrSymb"].tolist()]
 
             tickers = sorted(set(tickers))
-            if len(tickers) > 100:       # sanity check — expect 1800+ EQ + 600+ SM
-                print(f"{Fore.CYAN}  ✓ Loaded {len(tickers)} NSE tickers "
-                      f"from bhavcopy ({dt}){Style.RESET_ALL}")
-                return tickers
+            dropped = raw_total - len(tickers)
+            _filt = (f" (filtered out {dropped} illiquid / zero-volume; "
+                     f"min_vol={min_volume:,})") if dropped > 0 else ""
+            print(f"{Fore.CYAN}  ✓ Loaded {len(tickers)} tradable NSE tickers "
+                  f"from bhavcopy ({dt}){_filt}{Style.RESET_ALL}")
+            return tickers
         except Exception as exc:
             print(f"{Fore.YELLOW}  ⚠ bhavcopy fetch failed "
                   f"({exc.__class__.__name__}), trying previous day{Style.RESET_ALL}")
@@ -424,8 +548,6 @@ def _fetch_nse_data(ticker: str) -> pd.DataFrame | None:
     Works for both mainboard (series EQ) and SME/Emerge (series SM) stocks.
     Downloads daily files in parallel — no Cloudflare issues (nsearchives subdomain).
     """
-    import io
-    import zipfile
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     # Parse ticker: "PRANIK-SM" → base="PRANIK", series="SM"
@@ -437,24 +559,12 @@ def _fetch_nse_data(ticker: str) -> pd.DataFrame | None:
         base_sym = ticker.upper()
         series   = "EQ"
 
-    bhav_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/124.0.0.0 Safari/537.36",
-        "Referer": "https://www.nseindia.com/",
-    }
-
     def _fetch_one_day(dt: date):
-        """Download bhavcopy for one date, return (date, row_dict) or None."""
-        ds  = dt.strftime("%Y%m%d")
-        url = (f"https://nsearchives.nseindia.com/content/cm/"
-               f"BhavCopy_NSE_CM_0_0_0_{ds}_F_0000.csv.zip")
+        """Read one date's bhavcopy (via the daily disk cache) → row_dict or None."""
+        df = _get_bhavcopy(dt, timeout=15)
+        if df is None:
+            return None
         try:
-            r = requests.get(url, headers=bhav_headers, timeout=15)
-            if r.status_code != 200:
-                return None
-            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-                df = pd.read_csv(z.open(z.namelist()[0]), dtype=str)
             row = df[
                 (df["TckrSymb"].str.strip().str.upper() == base_sym) &
                 (df["SctySrs"].str.strip().str.upper() == series)
@@ -1587,6 +1697,11 @@ def main():
         choices=["1m", "5m", "15m", "1h", "1d", "1wk"],
         help="Candle interval (default: 1d)"
     )
+    parser.add_argument(
+        "--min-volume", type=int, default=0,
+        help="For --all-nse / --all-nse-sme: drop stocks whose bhavcopy traded "
+             "volume that day is below this (zero-volume always dropped)."
+    )
     args = parser.parse_args()
 
     if args.zerodha_login:
@@ -1595,10 +1710,10 @@ def main():
 
     if args.all_nse_sme:
         print(f"{Fore.CYAN}  Fetching all NSE + SME tickers from bhavcopy...{Style.RESET_ALL}")
-        tickers = fetch_all_nse_tickers(include_sme=True)
+        tickers = fetch_all_nse_tickers(include_sme=True, min_volume=args.min_volume)
     elif args.all_nse:
         print(f"{Fore.CYAN}  Fetching all NSE mainboard tickers from bhavcopy...{Style.RESET_ALL}")
-        tickers = fetch_all_nse_tickers(include_sme=False)
+        tickers = fetch_all_nse_tickers(include_sme=False, min_volume=args.min_volume)
     elif args.zerodha:
         tickers = fetch_zerodha_holdings()
     elif args.stocks:

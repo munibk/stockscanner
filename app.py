@@ -40,6 +40,8 @@ from stockupdate import (
     NIFTY_INTRADAY_STOCKS,
     _NewlyListedError,
     MIN_ROWS,
+    bhavcopy_cache_info,
+    clear_bhavcopy_cache,
 )
 
 import watchlist as _wl
@@ -199,8 +201,24 @@ with st.sidebar:
     min_avg_vol = st.number_input(
         "Min avg daily volume (shares, 0 = off)", min_value=0, value=0, step=1000,
         help="Skip illiquid stocks whose 20-bar average volume is below this. "
-             "Useful for All-NSE / SME scans.",
+             "For All-NSE / SME scans this ALSO pre-filters the bhavcopy by that "
+             "day's traded volume, so illiquid names are dropped before fetching "
+             "(much faster). Zero-volume stocks are always excluded.",
     )
+
+    st.divider()
+    st.markdown("**🗂️ Bhavcopy cache**")
+    _cache_info = bhavcopy_cache_info()
+    _cache_mb = _cache_info["bytes"] / (1024 * 1024)
+    st.caption(
+        f"{_cache_info['files']} cached day(s) · {_cache_mb:.1f} MB. "
+        "The NSE bhavcopy is downloaded once per day and reused; clear it to force a fresh download."
+    )
+    if st.button("🗑️ Delete cached bhavcopy", disabled=_cache_info["files"] == 0,
+                 help="Removes the locally cached bhavcopy files. The next All-NSE scan re-downloads the latest copy."):
+        _cleared = clear_bhavcopy_cache()
+        st.success(f"Deleted {_cleared['deleted']} cached file(s), freed {_cleared['bytes_freed'] / (1024*1024):.1f} MB.")
+        st.rerun()
 
     st.divider()
     live_monitor = st.toggle("📗 Live Monitor (auto-refresh)", value=False)
@@ -502,13 +520,17 @@ if not _cache_fresh:
 
     elif mode == "All NSE Stocks":
         with st.spinner("Downloading NSE bhavcopy to get all listed stocks..."):
-            tickers = fetch_all_nse_tickers(include_sme=False)
-        st.info(f"📂 {len(tickers)} NSE mainboard stocks loaded. Large scan — may take several minutes.")
+            tickers = fetch_all_nse_tickers(include_sme=False, min_volume=int(min_avg_vol))
+        st.info(f"📂 {len(tickers)} tradable NSE mainboard stocks loaded"
+                + (f" (bhavcopy volume ≥ {int(min_avg_vol):,})" if min_avg_vol > 0 else " (zero-volume excluded)")
+                + ". Large scan — may take several minutes.")
 
     elif mode == "All NSE + SME":
         with st.spinner("Downloading NSE bhavcopy (mainboard + SME/Emerge)..."):
-            tickers = fetch_all_nse_tickers(include_sme=True)
-        st.info(f"📂 {len(tickers)} stocks loaded (mainboard + SME). Very large scan — may take 10–20+ minutes.")
+            tickers = fetch_all_nse_tickers(include_sme=True, min_volume=int(min_avg_vol))
+        st.info(f"📂 {len(tickers)} tradable stocks loaded (mainboard + SME)"
+                + (f" (bhavcopy volume ≥ {int(min_avg_vol):,})" if min_avg_vol > 0 else " (zero-volume excluded)")
+                + ". Very large scan — may take 10–20+ minutes.")
 
     elif mode == "Custom Tickers":
         raw     = custom_input.replace(",", " ").replace("\n", " ").split()

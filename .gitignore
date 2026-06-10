@@ -5,6 +5,9 @@ zerodha.cfg
 # User's personal watchlist (local to each machine)
 watchlist.json
 
+# Cached daily NSE bhavcopy files (re-downloaded as needed)
+.bhavcache/
+
 # Python cache
 __pycache__/
 *.py[cod]
