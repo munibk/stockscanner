@@ -7,6 +7,7 @@ Then open http://localhost:8501 in your browser.
 """
 
 import importlib
+import json
 import sys
 import os
 from datetime import datetime, date, timedelta
@@ -39,6 +40,16 @@ from stockupdate import (
     NIFTY_INTRADAY_STOCKS,
     _NewlyListedError,
     MIN_ROWS,
+)
+
+import watchlist as _wl
+importlib.reload(_wl)
+from watchlist import (
+    load_watchlist,
+    add_to_watchlist,
+    remove_from_watchlist,
+    save_watchlist,
+    is_watched,
 )
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -101,7 +112,7 @@ with st.sidebar:
         "All NSE Stocks",
         "All NSE + SME",
         "Custom Tickers",
-    ] + (["Zerodha Portfolio"] if _kite_available else [])
+    ] + (["Zerodha Portfolio"] if _kite_available else []) + ["⭐ My Watchlist"]
     mode = st.radio("Stock List", _mode_options, index=0)
 
     # ── Zerodha: show login link + request_token input ──
@@ -204,6 +215,223 @@ with st.sidebar:
 # ── Auto-run when live monitor is active ────────────────────────────────────────
 run = run or (live_monitor and st.session_state.get("live_active", False))
 
+
+# ── Signal cell styler (shared by watchlist, live table, final table) ─────────
+def _style_signal(val):
+    if val == "BUY":
+        return "background-color: #0d3b26; color: #00e676; font-weight: bold"
+    if val == "SELL":
+        return "background-color: #3b0d0d; color: #ff5252; font-weight: bold"
+    if val == "VOID":
+        return "background-color: #1a1a1a; color: #888888; font-weight: bold"
+    return "background-color: #3b3b0d; color: #ffd600"
+
+
+# ── Watchlist page (short-circuits the scanner flow) ─────────────────────────
+def _signal_badge_html(sig: str) -> str:
+    css = {
+        "BUY":  "background:#0d3b26;color:#00e676",
+        "SELL": "background:#3b0d0d;color:#ff5252",
+        "HOLD": "background:#3b3b0d;color:#ffd600",
+        "VOID": "background:#1a1a1a;color:#888888",
+    }.get(sig, "background:#3b3b0d;color:#ffd600")
+    return f'<span style="{css};padding:2px 8px;border-radius:6px;font-weight:bold">{sig}</span>'
+
+
+def _evaluate_watchlist(items: list[dict]) -> list[dict]:
+    """Re-fetch live data for each entry and compute current signal + change%."""
+    rows = []
+    prog = st.progress(0.0, text="Refreshing watchlist...")
+    for i, it in enumerate(items):
+        tkr, ivl = it["ticker"], it.get("interval", "1d")
+        prog.progress((i + 1) / len(items), text=f"Updating {tkr} ({ivl})...")
+        row = dict(it)
+        try:
+            df = fetch_data(tkr, ivl)
+            if df is None or len(df) < MIN_ROWS:
+                raise ValueError("no data")
+            df = compute_indicators(df, ivl)
+            sig = generate_signal(df, ivl)
+            cur_price = sig["price"]
+            row.update({
+                "current_price":  cur_price,
+                "current_signal": sig["signal"],
+                "current_score":  sig["score"],
+                "change_pct":     (cur_price - it["added_price"]) / it["added_price"] * 100
+                                  if it.get("added_price") else 0.0,
+                "rsi":            sig["rsi"],
+                "target":         sig.get("target1"),
+                "stop":           sig.get("stop_loss"),
+                "regime":         sig.get("regime", "—"),
+                "summary":        sig.get("summary", ""),
+                "ok":             True,
+            })
+        except Exception:
+            row.update({"ok": False, "current_signal": "—", "current_price": None,
+                        "current_score": None, "change_pct": None})
+        rows.append(row)
+    prog.empty()
+    return rows
+
+
+if mode == "⭐ My Watchlist":
+    st.title("⭐ My Watchlist")
+    st.caption(
+        "Stocks you're tracking, with the snapshot from when you added them vs. the "
+        "live signal now. Add stocks here, or from the **Add to Watchlist** button on "
+        "any scan result."
+    )
+
+    # ── Add a stock manually ─────────────────────────────────────────────────
+    with st.form("wl_add_form", clear_on_submit=True):
+        _c1, _c2 = st.columns([3, 1])
+        _new_tkr = _c1.text_input("Add ticker (NSE symbol)", placeholder="RELIANCE")
+        _submit = _c2.form_submit_button("➕ Add", width="stretch", type="primary")
+        if _submit and _new_tkr.strip():
+            _t = _new_tkr.upper().strip()
+            with st.spinner(f"Fetching {_t} ({interval})..."):
+                try:
+                    _df = fetch_data(_t, interval)
+                    if _df is None or len(_df) < MIN_ROWS:
+                        st.error(f"Could not fetch enough data for {_t}.")
+                    else:
+                        _df = compute_indicators(_df, interval)
+                        _sig = generate_signal(_df, interval)
+                        _added, _msg = add_to_watchlist(
+                            _t, _sig["price"], _sig["signal"], _sig["score"], interval
+                        )
+                        (st.success if _added else st.warning)(_msg)
+                        st.rerun()
+                except Exception as _e:
+                    st.error(f"Failed to add {_t}: {_e}")
+
+    _items = load_watchlist()
+    if not _items:
+        st.info("Your watchlist is empty. Add a ticker above, or use **Add to Watchlist** on a scan result.")
+        st.stop()
+
+    _wc1, _wc2, _wc3 = st.columns([1, 1, 2])
+    _do_refresh = _wc1.button("🔄 Refresh prices", type="primary")
+    if _wc2.button("🗑️ Clear all"):
+        save_watchlist([])
+        st.rerun()
+
+    # Evaluate (cache in session so removing a row doesn't re-fetch everything)
+    _wl_cache_key = "wl_eval_cache"
+    _items_sig = [(it["ticker"], it.get("interval"), it.get("added_at")) for it in _items]
+    _cache = st.session_state.get(_wl_cache_key)
+    if _do_refresh or _cache is None or _cache.get("sig") != _items_sig:
+        _evaluated = _evaluate_watchlist(_items)
+        st.session_state[_wl_cache_key] = {"sig": _items_sig, "rows": _evaluated}
+    else:
+        _evaluated = _cache["rows"]
+
+    # ── Summary table ────────────────────────────────────────────────────────
+    _flipped = 0
+    _table = []
+    for r in _evaluated:
+        _chg = r.get("change_pct")
+        _changed = r.get("ok") and r.get("current_signal") != r.get("added_signal")
+        if _changed:
+            _flipped += 1
+        _table.append({
+            "Ticker":         r["ticker"],
+            "TF":             r.get("interval", "1d"),
+            "Added On":       r.get("added_at", "—"),
+            "Added Price":    f"₹{r['added_price']:,.2f}" if r.get("added_price") else "—",
+            "Added Signal":   r.get("added_signal", "—"),
+            "Current Price":  f"₹{r['current_price']:,.2f}" if r.get("current_price") else "—",
+            "Current Signal": r.get("current_signal", "—"),
+            "Score":          f"{r['current_score']:.0f}" if r.get("current_score") is not None else "—",
+            "Change %":       round(_chg, 2) if _chg is not None else None,
+            "Signal Changed": "⚠️ yes" if _changed else "",
+            "Target":         f"₹{r['target']:,.2f}" if r.get("target") else "—",
+            "Stop":           f"₹{r['stop']:,.2f}" if r.get("stop") else "—",
+        })
+
+    if _flipped:
+        st.warning(f"⚠️ {_flipped} stock(s) have a different signal now than when you added them — review below.")
+
+    def _style_change(v):
+        if v is None:
+            return ""
+        return "color:#00e676;font-weight:bold" if v >= 0 else "color:#ff5252;font-weight:bold"
+
+    _wl_df = pd.DataFrame(_table)
+    st.dataframe(
+        _wl_df.style
+            .map(_style_signal, subset=["Added Signal", "Current Signal"])
+            .map(_style_change, subset=["Change %"])
+            .format({"Change %": "{:+.2f}%"}, na_rep="—"),
+        use_container_width=True, hide_index=True,
+    )
+
+    # ── Per-stock cards with remove button + plain-English signal ─────────────
+    st.markdown("### Details")
+    for r in _evaluated:
+        _icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡", "VOID": "⚫"}.get(r.get("current_signal"), "⚪")
+        _chg = r.get("change_pct")
+        _chg_str = f"{_chg:+.2f}%" if _chg is not None else "n/a"
+        with st.expander(f"{_icon}  {r['ticker']} ({r.get('interval','1d')})  —  now {r.get('current_signal','—')}  |  {_chg_str} since added"):
+            _lc, _rc = st.columns([2, 3])
+            with _lc:
+                st.markdown(f"**Added:** {r.get('added_at','—')}")
+                st.markdown(
+                    f"**Added signal:** {_signal_badge_html(r.get('added_signal','—'))} "
+                    f"at ₹{r.get('added_price', 0):,.2f}",
+                    unsafe_allow_html=True,
+                )
+                if r.get("ok"):
+                    st.markdown(
+                        f"**Current signal:** {_signal_badge_html(r.get('current_signal','—'))} "
+                        f"(score {r.get('current_score', 0):.0f}) at ₹{r.get('current_price', 0):,.2f}",
+                        unsafe_allow_html=True,
+                    )
+                    _cc = "green" if (_chg or 0) >= 0 else "red"
+                    st.markdown(f"**Change since added:** :{_cc}[{_chg_str}]")
+                    st.markdown(f"**RSI:** {r.get('rsi','—')}  |  **Regime:** {str(r.get('regime','—')).title()}")
+                    if r.get("target") and r.get("stop"):
+                        st.markdown(f"🎯 **Target:** ₹{r['target']:,.2f}  🛑 **Stop:** ₹{r['stop']:,.2f}")
+                else:
+                    st.error("Could not fetch live data for this stock right now.")
+                if st.button("🗑️ Remove", key=f"wl_rm_{r['ticker']}_{r.get('interval','1d')}"):
+                    remove_from_watchlist(r["ticker"], r.get("interval", "1d"))
+                    st.session_state.pop(_wl_cache_key, None)
+                    st.rerun()
+            with _rc:
+                if r.get("ok") and r.get("summary"):
+                    st.info(f"💬 {r['summary']}")
+
+    # ── Export / import for permanent storage ────────────────────────────────
+    st.divider()
+    _ec1, _ec2 = st.columns(2)
+    _ec1.download_button(
+        "⬇️ Export watchlist (JSON)",
+        data=json.dumps(_items, indent=2),
+        file_name="watchlist.json",
+        mime="application/json",
+    )
+    _up = _ec2.file_uploader("⬆️ Import watchlist (JSON)", type=["json"])
+    if _up is not None:
+        try:
+            _imported = json.loads(_up.getvalue().decode("utf-8"))
+            if isinstance(_imported, list):
+                save_watchlist(_imported)
+                st.session_state.pop(_wl_cache_key, None)
+                st.success(f"Imported {len(_imported)} watchlist entries.")
+                st.rerun()
+            else:
+                st.error("Invalid watchlist file format.")
+        except Exception as _e:
+            st.error(f"Could not import: {_e}")
+
+    st.caption(
+        "ℹ️ On Streamlit Cloud the watchlist file resets on redeploy/reboot — "
+        "use **Export** to keep a permanent copy and **Import** to restore it."
+    )
+    st.stop()
+
+
 # ── Scan result cache (session-state backed, TTL per interval) ────────────────
 import time as _time
 
@@ -231,16 +459,6 @@ if not run and not _cache_fresh:
     col2.info("**Price Targets**\n\nSupport & Resistance zones from swing levels, pivot points & round numbers")
     col3.info("**Charts**\n\nInteractive candlestick with EMA20, EMA50, SMA200, Volume & RSI")
     st.stop()
-
-# ── Signal cell styler (shared by live table, final table, and cache path) ────
-def _style_signal(val):
-    if val == "BUY":
-        return "background-color: #0d3b26; color: #00e676; font-weight: bold"
-    if val == "SELL":
-        return "background-color: #3b0d0d; color: #ff5252; font-weight: bold"
-    if val == "VOID":
-        return "background-color: #1a1a1a; color: #888888; font-weight: bold"
-    return "background-color: #3b3b0d; color: #ffd600"
 
 # ── Fast path: load results from session-state cache ─────────────────────────
 if _cache_fresh:
@@ -571,6 +789,16 @@ for _lo, _hi, _band_lbl in _PRICE_BANDS:
                 }.get(r["signal"], "background:#3b3b0d;color:#ffd600;padding:6px 14px;border-radius:8px;font-weight:bold;font-size:1.1rem")
                 st.markdown(f'<span style="{_badge_css}">{r["signal"]} &nbsp; {r["score"]:.0f}/100</span>', unsafe_allow_html=True)
                 st.markdown("")
+
+                if is_watched(r["ticker"], interval):
+                    st.caption(f"⭐ In your watchlist ({interval})")
+                elif st.button("⭐ Add to Watchlist", key=f"wl_add_{r['ticker']}_{interval}"):
+                    _added, _msg = add_to_watchlist(
+                        r["ticker"], r["price"], r["signal"], r["score"], interval
+                    )
+                    st.session_state.pop("wl_eval_cache", None)
+                    st.toast(_msg, icon="⭐" if _added else "ℹ️")
+                    st.rerun()
 
                 _d_left, _d_right = st.columns([2, 3])
 

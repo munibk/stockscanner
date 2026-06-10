@@ -2,6 +2,9 @@
 zerodha.cfg
 .zerodha_token.json
 
+# User's personal watchlist (local to each machine)
+watchlist.json
+
 # Python cache
 __pycache__/
 *.py[cod]
