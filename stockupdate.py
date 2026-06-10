@@ -40,22 +40,20 @@ from colorama import Fore, Style, init
 from tabulate import tabulate
 
 # Windows consoles default to cp1252 and crash on the ✓ / ⚠ / box-drawing glyphs
-# used in CLI output. Force UTF-8 so the CLI works everywhere.
+# used in CLI output. Force UTF-8 (this only changes the encoding — it does NOT
+# wrap the stream, so it is safe to run on every import/reload).
 #
-# IMPORTANT: app.py calls importlib.reload(stockupdate) on every Streamlit rerun.
-# colorama.init() wraps sys.stdout, so re-running it on each reload stacks a fresh
-# wrapper around the previous one. On a long-lived server (Streamlit Cloud) that
-# chain grows until a single print() recurses through every layer and raises
-# RecursionError. Guard the one-time IO setup with a sentinel on `sys` (which is
-# never reloaded) so it runs at most once per process.
-if not getattr(sys, "_stockupdate_io_configured", False):
-    for _stream in (sys.stdout, sys.stderr):
-        try:
-            _stream.reconfigure(encoding="utf-8")
-        except Exception:
-            pass
-    init(autoreset=True)
-    sys._stockupdate_io_configured = True
+# IMPORTANT: do NOT call colorama.init() here. init() replaces sys.stdout with a
+# delegating wrapper; under Streamlit (where stdout is already a captured stream
+# and this module is reloaded on every rerun) that wrapper recurses and raises
+# RecursionError on the next print(). colorama is therefore initialised lazily,
+# only when this file is run as a CLI (see main()). When imported as a library
+# the Fore/Style values are just inert ANSI strings, which is harmless.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # ── Zerodha / Kite Connect integration ────────────────────────────────────────
 CONFIG_FILE  = os.path.join(os.path.dirname(__file__), "zerodha.cfg")
@@ -1588,6 +1586,10 @@ def scan(tickers: list[str], interval: str, top: int | None) -> None:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main():
+    # Initialise colorama only for real CLI usage. It wraps sys.stdout, which is
+    # unsafe to do at import time under Streamlit (see the note near the top).
+    init(autoreset=True)
+
     parser = argparse.ArgumentParser(
         description="Nifty 50 Buy/Sell Signal Generator"
     )
