@@ -39,17 +39,7 @@ import yfinance as yf
 from colorama import Fore, Style, init
 from tabulate import tabulate
 
-# NOTE: do NOT call colorama.init() at import time. app.py runs
-# importlib.reload(stockupdate) on every Streamlit rerun, and init() replaces
-# sys.stdout with a delegating wrapper. Re-running it under Streamlit's captured
-# stdout makes that wrapper recurse, so the next print() raises RecursionError.
-# colorama is initialised lazily in main() (CLI only); when imported as a
-# library the Fore/Style values are just inert ANSI strings, which is harmless.
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+init(autoreset=True)
 
 # ── Zerodha / Kite Connect integration ────────────────────────────────────────
 CONFIG_FILE  = os.path.join(os.path.dirname(__file__), "zerodha.cfg")
@@ -1565,10 +1555,6 @@ def scan(tickers: list[str], interval: str, top: int | None) -> None:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main():
-    # Initialise colorama only for real CLI usage (it wraps sys.stdout, which is
-    # unsafe to do at import time under Streamlit — see the note near the top).
-    init(autoreset=True)
-
     parser = argparse.ArgumentParser(
         description="Nifty 50 Buy/Sell Signal Generator"
     )
